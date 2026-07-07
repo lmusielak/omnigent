@@ -794,9 +794,12 @@ def _classify_codex_error(error: dict[str, Any], message: str) -> str:
     Prefers the structured ``codexErrorInfo`` (an ``unauthorized`` variant or
     httpStatusCode 401/403 is auth; a ``usage_limit_exceeded`` / rate-limit
     variant or httpStatusCode 429 is quota, all case-insensitive); falls back
-    to substring matching against :data:`_CODEX_AUTH_ERROR_FRAGMENTS` then
-    :data:`_CODEX_QUOTA_ERROR_FRAGMENTS` for versions/shapes that omit it
-    (auth first, preserving the pre-quota classification for auth messages).
+    to substring matching for versions/shapes that omit it, checking
+    :data:`_CODEX_QUOTA_ERROR_FRAGMENTS` BEFORE
+    :data:`_CODEX_AUTH_ERROR_FRAGMENTS` — the same precedence as
+    :func:`omnigent.turn_errors.classify_turn_error_kind`, so a quota
+    message with an upsell ("hit your usage limit — sign in to upgrade")
+    classifies as quota on both sides and a quota fallback target fires.
 
     :param error: The ``turn.error`` object.
     :param message: Its already-extracted message text.
@@ -818,10 +821,10 @@ def _classify_codex_error(error: dict[str, Any], message: str) -> str:
     if variant_is_quota or http_status in _CODEX_QUOTA_HTTP_STATUS:
         return _CODEX_ERROR_KIND_QUOTA
     lowered = message.lower()
-    if any(fragment in lowered for fragment in _CODEX_AUTH_ERROR_FRAGMENTS):
-        return _CODEX_ERROR_KIND_AUTH
     if any(fragment in lowered for fragment in _CODEX_QUOTA_ERROR_FRAGMENTS):
         return _CODEX_ERROR_KIND_QUOTA
+    if any(fragment in lowered for fragment in _CODEX_AUTH_ERROR_FRAGMENTS):
+        return _CODEX_ERROR_KIND_AUTH
     return _CODEX_ERROR_KIND_GENERIC
 
 

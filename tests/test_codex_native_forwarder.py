@@ -1917,3 +1917,28 @@ async def test_post_turn_status_edge_without_error_omits_error_kind() -> None:
     assert len(client.posts) == 1
     _url, body = client.posts[0]
     assert "error_kind" not in body["data"]
+
+
+def test_classify_codex_error_quota_with_auth_upsell_matches_runner_classifier() -> None:
+    """A quota message with a sign-in upsell classifies as quota, not auth.
+
+    The forwarder's verdict rides the status payload and wins over the
+    runner's own text classification, so the two must agree: text quota
+    fragments are checked BEFORE text auth fragments (matching
+    ``classify_turn_error_kind``). Otherwise "hit your usage limit — sign
+    in to upgrade" became auth and an ``on: [quota]`` fallback never fired.
+    """
+    from omnigent.turn_errors import classify_turn_error_kind
+
+    message = "You've hit your usage limit — sign in to upgrade your plan."
+    assert fwd._classify_codex_error({}, message) == fwd._CODEX_ERROR_KIND_QUOTA
+    assert classify_turn_error_kind(message) == fwd._CODEX_ERROR_KIND_QUOTA
+    # Pure auth text still classifies as auth (reauth hint behavior kept).
+    assert fwd._classify_codex_error({}, "Please run codex login") == fwd._CODEX_ERROR_KIND_AUTH
+    # Structured auth beats everything, including quota-looking text.
+    assert (
+        fwd._classify_codex_error(
+            {"codexErrorInfo": {"type": "unauthorized"}}, "usage limit reached"
+        )
+        == fwd._CODEX_ERROR_KIND_AUTH
+    )

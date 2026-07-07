@@ -72,6 +72,20 @@ def test_classifier_auth_by_code_and_text() -> None:
     assert classify_turn_error_kind("token expired, re-authenticate") == "auth"
 
 
+def test_classifier_does_not_false_positive_on_code_like_text() -> None:
+    """Digits that merely contain 429, and token counts, are not quota.
+
+    A false quota positive replays the message on a fresh child and
+    re-executes side effects, so "429" only matches the structured code.
+    """
+    assert classify_turn_error_kind("request id abc429def") == "generic"
+    assert classify_turn_error_kind("14290 tokens") == "generic"
+    assert classify_turn_error_kind("processed 14290 tokens in 4290ms") == "generic"
+    assert classify_turn_error_kind("error 429") == "generic"
+    # Anchored phrases still match, including quoted tool output.
+    assert classify_turn_error_kind("GitHub API rate limit exceeded") == "quota"
+
+
 def test_classifier_generic_otherwise() -> None:
     assert classify_turn_error_kind(None) == "generic"
     assert classify_turn_error_kind("") == "generic"
@@ -206,6 +220,8 @@ def _clean_subagent_registry() -> Iterator[None]:
         set(runner_app._drained_delivered_subagent_children),
         dict(runner_app._child_session_parents),
         dict(runner_app._session_agent_ids_ref),
+        {k: set(v) for k, v in runner_app._pending_subagent_fallbacks.items()},
+        dict(runner_app._superseded_subagent_children_map),
     )
     runner_app._subagent_work_by_child.clear()
     runner_app._subagent_work_by_parent.clear()
@@ -213,6 +229,8 @@ def _clean_subagent_registry() -> Iterator[None]:
     runner_app._drained_delivered_subagent_children.clear()
     runner_app._child_session_parents.clear()
     runner_app._session_agent_ids_ref.clear()
+    runner_app._pending_subagent_fallbacks.clear()
+    runner_app._superseded_subagent_children_map.clear()
     try:
         yield
     finally:
@@ -228,6 +246,10 @@ def _clean_subagent_registry() -> Iterator[None]:
         runner_app._child_session_parents.update(saved[4])
         runner_app._session_agent_ids_ref.clear()
         runner_app._session_agent_ids_ref.update(saved[5])
+        runner_app._pending_subagent_fallbacks.clear()
+        runner_app._pending_subagent_fallbacks.update(saved[6])
+        runner_app._superseded_subagent_children_map.clear()
+        runner_app._superseded_subagent_children_map.update(saved[7])
 
 
 class _FallbackServerClient(NullServerClient):
@@ -236,13 +258,26 @@ class _FallbackServerClient(NullServerClient):
     Serves session snapshots for the parent and both children, accepts the
     tombstone PATCH, records the fallback child create (returning a fixed
     new session id), and records every ``/events`` POST so the test can
-    assert the original message was replayed.
+    assert the original message was replayed. Failure modes are opt-in so
+    each fail-safe branch of the engine can be driven.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        existing_children: list[dict[str, Any]] | None = None,
+        fail_create: bool = False,
+        fail_patch: bool = False,
+        fail_message_post_to: str | None = None,
+    ) -> None:
         self.created_sessions: list[dict[str, Any]] = []
         self.event_posts: list[tuple[str, dict[str, Any]]] = []
+        self.policy_posts: list[tuple[str, dict[str, Any]]] = []
         self.patches: list[tuple[str, dict[str, Any]]] = []
+        self._existing_children = existing_children or []
+        self._fail_create = fail_create
+        self._fail_patch = fail_patch
+        self._fail_message_post_to = fail_message_post_to
 
     class _JsonResp:
         def __init__(self, payload: dict[str, Any], status_code: int = 200) -> None:
@@ -282,6 +317,8 @@ class _FallbackServerClient(NullServerClient):
         path = url.rstrip("/")
         if path.endswith("/items"):
             return self._JsonResp({"data": [], "has_more": False})
+        if path.endswith("/child_sessions"):
+            return self._JsonResp({"data": self._existing_children})
         if "/v1/sessions/" in path:
             return self._JsonResp(self._snapshot(path.rsplit("/", 1)[-1]))
         return self._Response()
@@ -290,15 +327,28 @@ class _FallbackServerClient(NullServerClient):
         path = url.rstrip("/")
         body = kwargs.get("json") or {}
         if path.endswith("/v1/sessions") or path == "/v1/sessions":
+            if self._fail_create:
+                raise RuntimeError("create exploded mid-flight")
             self.created_sessions.append(dict(body))
             return self._JsonResp({"id": FALLBACK_CHILD_SESSION_ID})
+        if path.endswith("/policies"):
+            self.policy_posts.append((path, dict(body)))
+            return self._Response()
         if path.endswith("/events"):
             self.event_posts.append((path, dict(body)))
+            if (
+                self._fail_message_post_to is not None
+                and f"/{self._fail_message_post_to}/" in path
+                and body.get("type") == "message"
+            ):
+                return self._JsonResp({}, status_code=500)
             return self._Response()
         return self._Response()
 
     async def patch(self, url: str, **kwargs: Any) -> Any:
         self.patches.append((url, dict(kwargs.get("json") or {})))
+        if self._fail_patch:
+            return self._JsonResp({}, status_code=500)
         return self._Response()
 
 
@@ -342,6 +392,7 @@ def _register_failed_dispatch(
     fallback_index: int = 0,
     fallback_history: list[str] | None = None,
     child_session_id: str = CHILD_SESSION_ID,
+    cost_budget: dict[str, Any] | None = None,
 ) -> Any:
     """Seed the parent inbox and a dispatched work entry, as sys_session_send does."""
     runner_app._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
@@ -352,6 +403,7 @@ def _register_failed_dispatch(
         title="review",
         message=REVIEW_MESSAGE,
         active_harness="codex-native",
+        cost_budget=cost_budget,
         fallback_targets=fallback_targets,
         fallback_index=fallback_index,
         fallback_history=fallback_history,
@@ -396,7 +448,8 @@ async def test_quota_failure_redispatches_on_fallback_and_suppresses_delivery(
     monkeypatch.setattr(
         "omnigent.onboarding.harness_install.missing_harness_cli", lambda harness: None
     )
-    entry = _register_failed_dispatch(fallback_targets=_PI_GEMINI_TARGETS)
+    budget = {"max_cost_usd": 2.5}
+    entry = _register_failed_dispatch(fallback_targets=_PI_GEMINI_TARGETS, cost_budget=budget)
     original_work_id = entry.work_id
     server = _FallbackServerClient()
     app = _build_app(server, _parent_spec(_reviewer_spec(None)))
@@ -451,6 +504,18 @@ async def test_quota_failure_redispatches_on_fallback_and_suppresses_delivery(
     assert new_entry.fallback_history == [
         "codex-native failed: quota — retrying on pi/google/gemini-2.5-pro"
     ]
+    # The original cost budget travels with the work: the fallback child
+    # got the same subagent_cost_budget policy attached, and the entry
+    # retains it for any further hop.
+    assert new_entry.cost_budget == budget
+    policy_bodies = [body for path, body in server.policy_posts]
+    assert policy_bodies and policy_bodies[0]["factory_params"] == budget
+    # Stale handles resolve to the live replacement, and the in-flight
+    # marker that kept the parent in "waiting" is gone.
+    assert runner_app.resolve_superseded_subagent_child(CHILD_SESSION_ID) == (
+        FALLBACK_CHILD_SESSION_ID
+    )
+    assert runner_app._pending_subagent_fallbacks == {}
 
 
 @pytest.mark.asyncio
@@ -617,6 +682,7 @@ async def test_missing_cli_fallback_target_is_skipped_with_history(
         await _wait_for(lambda: not inbox.empty())
 
     assert server.created_sessions == [], "an uninstallable target must not be spawned"
+    assert server.patches == [], "an undispatchable block must not tombstone the child"
     items = _drain_parent_inbox()
     assert len(items) == 1
     payload = items[0]
@@ -625,3 +691,253 @@ async def test_missing_cli_fallback_target_is_skipped_with_history(
     assert "[fallback history]" in payload["output"]
     assert "skipped" in payload["output"]
     assert "'pi' CLI on PATH" in payload["output"]
+    assert runner_app._pending_subagent_fallbacks == {}
+
+
+@pytest.mark.asyncio
+async def test_fallback_dispatch_crash_still_delivers_original_failure(
+    _clean_subagent_registry: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crash inside the fallback task must not vanish the work.
+
+    The old entry is superseded before the async re-dispatch runs, so an
+    unhandled exception (here: the create POST raising) would otherwise
+    leave the parent waiting forever. The fail-safe delivers the ORIGINAL
+    failure with a dispatch-failed note in the history.
+    """
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_install.missing_harness_cli", lambda harness: None
+    )
+    _register_failed_dispatch(fallback_targets=_PI_GEMINI_TARGETS)
+    server = _FallbackServerClient(fail_create=True)
+    app = _build_app(server, _parent_spec(_reviewer_spec(None)))
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            f"/v1/sessions/{CHILD_SESSION_ID}/events",
+            json={
+                "type": "external_session_status",
+                "data": {"status": "failed", "output": QUOTA_OUTPUT, "error_kind": "quota"},
+            },
+        )
+        assert resp.status_code == 204
+        inbox = runner_app._session_inboxes_ref[PARENT_SESSION_ID]
+        await _wait_for(lambda: not inbox.empty())
+
+    items = _drain_parent_inbox()
+    assert len(items) == 1
+    payload = items[0]
+    assert payload["status"] == "failed"
+    assert QUOTA_OUTPUT in payload["output"]
+    assert "[fallback dispatch failed:" in payload["output"]
+    assert "RuntimeError" in payload["output"]
+    assert runner_app._pending_subagent_fallbacks == {}
+
+
+@pytest.mark.asyncio
+async def test_continuation_send_does_not_arm_fallback(
+    _clean_subagent_registry: None,
+) -> None:
+    """(H2) A continuation send to an existing child dispatches with fallback inert.
+
+    The existing child holds the conversation history; replaying only the
+    last message on a fresh child would present an incomplete answer as
+    authoritative. So the entry stores no targets/message, and a later
+    quota failure delivers as a plain failure.
+    """
+    from omnigent.runner.tool_dispatch import _execute_subagent_tool
+
+    reviewer = _reviewer_spec(
+        [{"harness": "pi", "model": "google/gemini-2.5-pro", "on": ["quota"]}]
+    )
+    parent_spec = _parent_spec(reviewer)
+    server = _FallbackServerClient(
+        existing_children=[
+            {
+                "id": CHILD_SESSION_ID,
+                "tool": "reviewer",
+                "session_name": "review",
+                "labels": {},
+                "busy": False,
+            }
+        ]
+    )
+    runner_app._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
+    runner_app._session_agent_ids_ref[PARENT_SESSION_ID] = "ag_orch"
+
+    handle = await _execute_subagent_tool(
+        {"agent": "reviewer", "title": "review", "args": "continue: also check tests"},
+        server_client=server,  # type: ignore[arg-type]
+        conversation_id=PARENT_SESSION_ID,
+        agent_spec=parent_spec,
+        session_inbox=runner_app._session_inboxes_ref[PARENT_SESSION_ID],
+    )
+    assert not handle.startswith("Error:"), handle
+
+    entry = runner_app.get_subagent_work(CHILD_SESSION_ID)
+    assert entry is not None
+    assert entry.fallback_targets == ()
+    assert entry.message is None
+    assert server.created_sessions == []  # continued, not re-created
+
+    # A quota failure on the continuation turn now delivers as-is.
+    app = _build_app(server, parent_spec)
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            f"/v1/sessions/{CHILD_SESSION_ID}/events",
+            json={
+                "type": "external_session_status",
+                "data": {"status": "failed", "output": QUOTA_OUTPUT, "error_kind": "quota"},
+            },
+        )
+        assert resp.status_code == 204
+
+    assert server.created_sessions == []
+    items = _drain_parent_inbox()
+    assert len(items) == 1
+    assert items[0]["status"] == "failed"
+    assert items[0]["output"] == QUOTA_OUTPUT
+
+
+@pytest.mark.asyncio
+async def test_fresh_spawn_arms_fallback_from_spec(
+    _clean_subagent_registry: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Control for H2: a fresh spawn through sys_session_send arms fallback."""
+    from omnigent.runner.tool_dispatch import _execute_subagent_tool
+
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_install.missing_harness_cli", lambda harness: None
+    )
+    reviewer = _reviewer_spec(
+        [{"harness": "pi", "model": "google/gemini-2.5-pro", "on": ["quota"]}]
+    )
+    parent_spec = _parent_spec(reviewer)
+    server = _FallbackServerClient()  # no existing children -> fresh create
+    runner_app._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
+    runner_app._session_agent_ids_ref[PARENT_SESSION_ID] = "ag_orch"
+
+    handle = await _execute_subagent_tool(
+        {"agent": "reviewer", "title": "review", "args": REVIEW_MESSAGE},
+        server_client=server,  # type: ignore[arg-type]
+        conversation_id=PARENT_SESSION_ID,
+        agent_spec=parent_spec,
+        session_inbox=runner_app._session_inboxes_ref[PARENT_SESSION_ID],
+    )
+    assert not handle.startswith("Error:"), handle
+
+    entry = runner_app.get_subagent_work(FALLBACK_CHILD_SESSION_ID)
+    assert entry is not None
+    assert entry.message == REVIEW_MESSAGE
+    assert entry.fallback_targets == _PI_GEMINI_TARGETS
+
+
+@pytest.mark.asyncio
+async def test_stale_handle_cancel_resolves_to_fallback_child(
+    _clean_subagent_registry: None,
+) -> None:
+    """(M2) sys_cancel_task with the superseded handle reaches the live child."""
+    from omnigent.runner.tool_dispatch import _cancel_subagent_task
+
+    server = _FallbackServerClient()
+    runner_app.register_subagent_work(
+        parent_session_id=PARENT_SESSION_ID,
+        child_session_id=FALLBACK_CHILD_SESSION_ID,
+        agent="reviewer",
+        title="review",
+    )
+    runner_app.record_subagent_supersession(CHILD_SESSION_ID, FALLBACK_CHILD_SESSION_ID)
+
+    result = await _cancel_subagent_task(
+        {"task_id": CHILD_SESSION_ID},
+        conversation_id=PARENT_SESSION_ID,
+        server_client=server,  # type: ignore[arg-type]
+    )
+
+    assert "no in-flight task" not in result
+    interrupt_posts = [
+        path for path, body in server.event_posts if body.get("type") == "interrupt"
+    ]
+    assert interrupt_posts and FALLBACK_CHILD_SESSION_ID in interrupt_posts[0]
+
+
+@pytest.mark.asyncio
+async def test_tombstone_failure_aborts_fallback_and_delivers_original(
+    _clean_subagent_registry: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """(L1) A non-2xx tombstone PATCH aborts the fallback fail-safe.
+
+    Creating the replacement would only hit the (parent, title) unique
+    index, so no create is attempted and the original failure delivers.
+    """
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_install.missing_harness_cli", lambda harness: None
+    )
+    _register_failed_dispatch(fallback_targets=_PI_GEMINI_TARGETS)
+    server = _FallbackServerClient(fail_patch=True)
+    app = _build_app(server, _parent_spec(_reviewer_spec(None)))
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            f"/v1/sessions/{CHILD_SESSION_ID}/events",
+            json={
+                "type": "external_session_status",
+                "data": {"status": "failed", "output": QUOTA_OUTPUT, "error_kind": "quota"},
+            },
+        )
+        assert resp.status_code == 204
+        inbox = runner_app._session_inboxes_ref[PARENT_SESSION_ID]
+        await _wait_for(lambda: not inbox.empty())
+
+    assert server.created_sessions == []
+    items = _drain_parent_inbox()
+    assert len(items) == 1
+    assert QUOTA_OUTPUT in items[0]["output"]
+    assert "[fallback dispatch failed:" in items[0]["output"]
+    assert "tombstone" in items[0]["output"]
+
+
+@pytest.mark.asyncio
+async def test_failed_message_post_closes_replacement_child(
+    _clean_subagent_registry: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """(L2) A replacement child whose message POST fails is closed, not leaked.
+
+    Otherwise the zombie session squats on the (parent, title) slot and a
+    later send adopts it. With no further target, the original failure
+    then delivers with the skip recorded.
+    """
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_install.missing_harness_cli", lambda harness: None
+    )
+    _register_failed_dispatch(fallback_targets=_PI_GEMINI_TARGETS)
+    server = _FallbackServerClient(fail_message_post_to=FALLBACK_CHILD_SESSION_ID)
+    app = _build_app(server, _parent_spec(_reviewer_spec(None)))
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            f"/v1/sessions/{CHILD_SESSION_ID}/events",
+            json={
+                "type": "external_session_status",
+                "data": {"status": "failed", "output": QUOTA_OUTPUT, "error_kind": "quota"},
+            },
+        )
+        assert resp.status_code == 204
+        inbox = runner_app._session_inboxes_ref[PARENT_SESSION_ID]
+        await _wait_for(lambda: not inbox.empty())
+
+    # Both tombstones happened: the original child (slot free) and the
+    # undispatched replacement (no zombie left holding the slot).
+    patched_ids = [url for url, _body in server.patches]
+    assert any(CHILD_SESSION_ID in url for url in patched_ids)
+    assert any(FALLBACK_CHILD_SESSION_ID in url for url in patched_ids)
+    assert runner_app.get_subagent_work(FALLBACK_CHILD_SESSION_ID) is None
+    items = _drain_parent_inbox()
+    assert len(items) == 1
+    assert items[0]["status"] == "failed"
+    assert QUOTA_OUTPUT in items[0]["output"]
+    assert "skipped" in items[0]["output"]

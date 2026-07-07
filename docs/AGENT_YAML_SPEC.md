@@ -325,8 +325,10 @@ executor:
 The fallback sits ABOVE the per-harness `retry:` policy (which retries
 transport-level request failures within one harness) and the executor's own
 turn handling: it only activates after a turn has terminally failed, and it
-never re-tries the same target. On success the delivered output is prefixed
-with a provenance note, e.g.
+never re-tries the same target. A fallback replays the original message on a
+fresh session, so configure it on read-only/idempotent agents (like a
+reviewer) or accept that side effects of the failed attempt may re-execute.
+On success the delivered output is prefixed with a provenance note, e.g.
 `[fallback: completed on pi/google/gemini-2.5-pro after codex-native quota limit]`;
 when every target is exhausted or none matches the error kind, the original
 failure is delivered with the fallback history appended.

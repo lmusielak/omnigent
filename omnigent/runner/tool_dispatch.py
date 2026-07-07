@@ -1441,6 +1441,10 @@ async def _execute_subagent_tool(
         publish_event=publish_event,
         active_harness=child_harness,
         active_model=child_model_override,
+        # Fallback arms only on fresh spawns; a continuation send's history
+        # lives in the existing child and cannot be replayed elsewhere.
+        arm_fallback=created_child,
+        cost_budget=cost_budget,
         fallback_targets=_subagent_fallback_targets(
             _find_subagent_spec(str(sub_agent_name), agent_spec)
         ),
@@ -1490,32 +1494,40 @@ class _CreatedSubagentChild:
     model_override: str | None
 
 
-async def _create_subagent_child_session(
+@dataclass(frozen=True)
+class _ValidatedChildCreate:
+    """
+    Validated harness/model resolution for a child-session create.
+
+    :param child_harness: The child's effective harness (spec harness or
+        the applied override), e.g. ``"codex-native"``; ``None`` if unknown.
+    :param harness_override_canonical: Canonical harness override to
+        persist on the create, or ``None`` when no override was requested.
+    :param model_override: The normalized model id to persist, or ``None``.
+    """
+
+    child_harness: str | None
+    harness_override_canonical: str | None
+    model_override: str | None
+
+
+def _validate_subagent_child_create(
     *,
-    server_client: httpx.AsyncClient,
-    conversation_id: str,
-    parent_agent_id: str,
     agent_spec: Any | None,
     sub_agent_name: str,
-    session_name: str,
     harness_override: str | None,
     require_harness_allowlist: bool,
     model: str | None,
-    cost_budget: dict[str, Any] | None,
-) -> _CreatedSubagentChild | str:
+) -> _ValidatedChildCreate | str:
     """
-    Validate and create a fresh child session on the server.
+    Run every pre-create check for a child-session spawn, without I/O.
 
-    The create half of ``sys_session_send``'s spawn path, extracted so the
-    cross-harness fallback engine can re-spawn a failed child with a
-    harness/model override through the exact same validation.
+    Shared by the spawn path and the fallback engine's upfront target
+    validation, so a fallback block can be proven dispatchable BEFORE any
+    server-side mutation (e.g. tombstoning the failed child's title).
 
-    :param server_client: httpx client pointed at the Omnigent server.
-    :param conversation_id: Parent session id, e.g. ``"conv_parent123"``.
-    :param parent_agent_id: Parent agent id, e.g. ``"ag_abc123"``.
     :param agent_spec: Parent agent's spec (or ``None``).
     :param sub_agent_name: Sub-agent name, e.g. ``"reviewer"``.
-    :param session_name: Child instance title, e.g. ``"auth"``.
     :param harness_override: Requested harness (alias or canonical), or
         ``None`` to use the sub-agent spec's harness.
     :param require_harness_allowlist: ``True`` for LLM-requested overrides
@@ -1523,8 +1535,7 @@ async def _create_subagent_child_session(
         ``False`` for spec-declared fallback targets, where a declared
         allowlist still gates the harness but an absent one does not.
     :param model: Validated requested model id, or ``None``.
-    :param cost_budget: Optional cost-budget policy params for the child.
-    :returns: The created child, or an ``"Error: ..."`` string.
+    :returns: The validated resolution, or an ``"Error: ..."`` string.
     """
     child_harness = _subagent_harness(sub_agent_name, agent_spec)
     # Apply an allowlisted per-dispatch harness override. The sub-agent
@@ -1590,17 +1601,7 @@ async def _create_subagent_child_session(
                 f"Install it with: {install} "
                 f"(or don't dispatch to {sub_agent_name!r} here)."
             )
-    # Create child session on the server (no initial items —
-    # those go via a separate POST so the server forwards them
-    # to the runner and triggers a turn).
-    create_body: dict[str, Any] = {
-        "agent_id": parent_agent_id,
-        "parent_session_id": conversation_id,
-        "title": f"{sub_agent_name}:{session_name}",
-        "sub_agent_name": sub_agent_name,
-    }
-    if harness_override_canonical is not None:
-        create_body["harness_override"] = harness_override_canonical
+    model_override: str | None = None
     if model is not None:
         # Reject up front when the child harness would silently
         # ignore the persisted override — no silent drops.
@@ -1621,12 +1622,75 @@ async def _create_subagent_child_session(
         # quotes what the caller sent), then mechanical
         # canonical<->gateway-local normalization. The normalized
         # id is what the server persists as model_override.
-        create_body["model_override"] = _normalize_subagent_model(
+        model_override = _normalize_subagent_model(
             model,
             sub_agent_name=sub_agent_name,
             agent_spec=agent_spec,
             harness=child_harness,
         )
+    return _ValidatedChildCreate(
+        child_harness=child_harness,
+        harness_override_canonical=harness_override_canonical,
+        model_override=model_override,
+    )
+
+
+async def _create_subagent_child_session(
+    *,
+    server_client: httpx.AsyncClient,
+    conversation_id: str,
+    parent_agent_id: str,
+    agent_spec: Any | None,
+    sub_agent_name: str,
+    session_name: str,
+    harness_override: str | None,
+    require_harness_allowlist: bool,
+    model: str | None,
+    cost_budget: dict[str, Any] | None,
+) -> _CreatedSubagentChild | str:
+    """
+    Validate and create a fresh child session on the server.
+
+    The create half of ``sys_session_send``'s spawn path, extracted so the
+    cross-harness fallback engine can re-spawn a failed child with a
+    harness/model override through the exact same validation.
+
+    :param server_client: httpx client pointed at the Omnigent server.
+    :param conversation_id: Parent session id, e.g. ``"conv_parent123"``.
+    :param parent_agent_id: Parent agent id, e.g. ``"ag_abc123"``.
+    :param agent_spec: Parent agent's spec (or ``None``).
+    :param sub_agent_name: Sub-agent name, e.g. ``"reviewer"``.
+    :param session_name: Child instance title, e.g. ``"auth"``.
+    :param harness_override: Requested harness (alias or canonical), or
+        ``None`` to use the sub-agent spec's harness.
+    :param require_harness_allowlist: See
+        :func:`_validate_subagent_child_create`.
+    :param model: Validated requested model id, or ``None``.
+    :param cost_budget: Optional cost-budget policy params for the child.
+    :returns: The created child, or an ``"Error: ..."`` string.
+    """
+    validated = _validate_subagent_child_create(
+        agent_spec=agent_spec,
+        sub_agent_name=sub_agent_name,
+        harness_override=harness_override,
+        require_harness_allowlist=require_harness_allowlist,
+        model=model,
+    )
+    if isinstance(validated, str):
+        return validated
+    # Create child session on the server (no initial items —
+    # those go via a separate POST so the server forwards them
+    # to the runner and triggers a turn).
+    create_body: dict[str, Any] = {
+        "agent_id": parent_agent_id,
+        "parent_session_id": conversation_id,
+        "title": f"{sub_agent_name}:{session_name}",
+        "sub_agent_name": sub_agent_name,
+    }
+    if validated.harness_override_canonical is not None:
+        create_body["harness_override"] = validated.harness_override_canonical
+    if validated.model_override is not None:
+        create_body["model_override"] = validated.model_override
     resp = await server_client.post("/v1/sessions", json=create_body, timeout=30.0)
     if resp.status_code >= 400:
         return f"Error: failed to create child session: {resp.status_code} {resp.text[:200]}"
@@ -1668,8 +1732,8 @@ async def _create_subagent_child_session(
     return _CreatedSubagentChild(
         child_session_id=str(child_session_id),
         wrapper_label=_session_wrapper_label(child_data),
-        harness=child_harness,
-        model_override=create_body.get("model_override"),
+        harness=validated.child_harness,
+        model_override=validated.model_override,
     )
 
 
@@ -1687,6 +1751,8 @@ async def _register_and_send_subagent_child(
     publish_event: Callable[[str, dict[str, Any]], None] | None,
     active_harness: str | None = None,
     active_model: str | None = None,
+    arm_fallback: bool = True,
+    cost_budget: dict[str, Any] | None = None,
     fallback_targets: tuple[FallbackTarget, ...] = (),
     fallback_index: int = 0,
     fallback_history: list[str] | None = None,
@@ -1717,6 +1783,14 @@ async def _register_and_send_subagent_child(
     :param active_harness: The child's effective harness, for fallback
         provenance, e.g. ``"codex-native"``.
     :param active_model: The child's persisted model override, if any.
+    :param arm_fallback: Whether this dispatch may fall back on failure.
+        ``False`` for continuation sends to an existing child: a fresh
+        fallback child would lack the conversation history, so replaying
+        only the last message would present an incomplete answer as
+        authoritative. The entry then stores no message/targets, keeping
+        the fallback engine inert (mirrors by-session-id sends).
+    :param cost_budget: Cost-budget policy params of this dispatch,
+        retained so a fallback child inherits the same budget.
     :param fallback_targets: Cross-harness fallback targets captured from
         the sub-agent spec at dispatch time.
     :param fallback_index: Index of the next un-tried fallback target.
@@ -1779,10 +1853,11 @@ async def _register_and_send_subagent_child(
         agent=sub_agent_name,
         title=session_name,
         wrapper_label=child_wrapper_label,
-        message=message,
+        message=message if arm_fallback else None,
         active_harness=active_harness,
         active_model=active_model,
-        fallback_targets=fallback_targets,
+        cost_budget=cost_budget,
+        fallback_targets=fallback_targets if arm_fallback else (),
         fallback_index=fallback_index,
         fallback_history=fallback_history,
         fallback_note=fallback_note,
@@ -1830,6 +1905,115 @@ async def _register_and_send_subagent_child(
     return None
 
 
+def _validated_fallback_model(target: FallbackTarget) -> tuple[str | None, str | None]:
+    """
+    Validate a fallback target's model id, if declared.
+
+    :param target: The fallback target being considered.
+    :returns: ``(model, error)`` — the validated model id (``None`` when
+        the target declares no model) and an ``"Error: ..."`` string when
+        validation failed (``None`` otherwise).
+    """
+    if target.model is None:
+        return None, None
+    try:
+        return validate_model_override(target.model), None
+    except ValueError as exc:
+        return None, f"Error: invalid fallback model {target.model!r}: {exc}"
+
+
+def validate_subagent_fallback_target(
+    *,
+    target: FallbackTarget,
+    sub_agent_name: str,
+    agent_spec: Any | None,
+) -> str | None:
+    """
+    Check whether a fallback target could be dispatched here, without I/O.
+
+    Runs the same harness/model validation the spawn performs (canonical
+    harness, optional allowed_harnesses gate, missing CLI probe, model
+    support/family checks) so the fallback engine can prove a target
+    viable BEFORE mutating any server state.
+
+    :param target: The fallback target to validate.
+    :param sub_agent_name: Sub-agent name, e.g. ``"reviewer"``.
+    :param agent_spec: Parent agent's spec (or ``None``).
+    :returns: ``None`` when dispatchable, or an ``"Error: ..."`` string.
+    """
+    model, model_error = _validated_fallback_model(target)
+    if model_error is not None:
+        return model_error
+    result = _validate_subagent_child_create(
+        agent_spec=agent_spec,
+        sub_agent_name=sub_agent_name,
+        harness_override=target.harness,
+        require_harness_allowlist=False,
+        model=model,
+    )
+    return result if isinstance(result, str) else None
+
+
+async def tombstone_superseded_subagent_child(
+    *,
+    server_client: httpx.AsyncClient,
+    child_session_id: str,
+    sub_agent_name: str,
+    session_name: str,
+) -> str | None:
+    """
+    Free a failed child's ``(parent, title)`` unique slot before fallback.
+
+    Rewrites the child's title with the same closed marker
+    ``sys_session_close`` uses (plus the closed label), so the fallback
+    replacement can be created under the original ``(agent, title)``.
+
+    :param server_client: httpx client pointed at the Omnigent server.
+    :param child_session_id: The failed child, e.g. ``"conv_child456"``.
+    :param sub_agent_name: Sub-agent name, e.g. ``"reviewer"``.
+    :param session_name: Child instance title, e.g. ``"auth"``.
+    :returns: ``None`` on success, or an ``"Error: ..."`` string. Callers
+        must abort the fallback on error — creating the replacement would
+        only hit the unique index.
+    """
+    try:
+        resp = await server_client.patch(
+            f"/v1/sessions/{child_session_id}",
+            json={
+                "title": (
+                    f"{sub_agent_name}:{session_name}{_CLOSED_TITLE_INFIX}{child_session_id}"
+                ),
+                "labels": {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE},
+            },
+            timeout=10.0,
+        )
+    except httpx.HTTPError as exc:
+        return (
+            f"Error: failed to tombstone superseded child {child_session_id}: "
+            f"{type(exc).__name__}: {exc}"
+        )
+    if resp.status_code >= 400:
+        return (
+            f"Error: failed to tombstone superseded child {child_session_id}: "
+            f"HTTP {resp.status_code}"
+        )
+    return None
+
+
+@dataclass(frozen=True)
+class FallbackDispatchResult:
+    """
+    Outcome of one fallback target dispatch attempt.
+
+    :param error: Why the target could not be dispatched, or ``None``.
+    :param child_session_id: The replacement child's session id on
+        success, e.g. ``"conv_child789"``; ``None`` on error.
+    """
+
+    error: str | None
+    child_session_id: str | None
+
+
 async def dispatch_subagent_fallback_target(
     *,
     server_client: httpx.AsyncClient,
@@ -1839,14 +2023,14 @@ async def dispatch_subagent_fallback_target(
     session_name: str,
     message: str,
     target: FallbackTarget,
-    superseded_child_session_id: str,
     work_id: str,
+    cost_budget: dict[str, Any] | None,
     fallback_targets: tuple[FallbackTarget, ...],
     fallback_index: int,
     fallback_history: list[str],
     fallback_note: str,
     publish_event: Callable[[str, dict[str, Any]], None] | None = None,
-) -> str | None:
+) -> FallbackDispatchResult:
     """
     Re-dispatch failed sub-agent work on one cross-harness fallback target.
 
@@ -1854,9 +2038,9 @@ async def dispatch_subagent_fallback_target(
     native children) with the target's harness/model overrides, replays the
     original user message, and registers a work entry that keeps the
     original ``work_id`` so the eventual completion lands in the parent
-    inbox as the same piece of work. The failed child's ``(parent, title)``
-    slot is freed first by tombstoning its title the same way
-    ``sys_session_close`` does.
+    inbox as the same piece of work. The caller must have freed the failed
+    child's ``(parent, title)`` slot first (see
+    :func:`tombstone_superseded_subagent_child`).
 
     :param server_client: httpx client pointed at the Omnigent server.
     :param parent_session_id: Parent session id, e.g. ``"conv_parent123"``.
@@ -1865,9 +2049,9 @@ async def dispatch_subagent_fallback_target(
     :param session_name: Child instance title, e.g. ``"auth"``.
     :param message: The original user message to replay.
     :param target: The fallback target to dispatch on.
-    :param superseded_child_session_id: The failed child being replaced,
-        e.g. ``"conv_child456"``.
     :param work_id: The original dispatch id to carry over.
+    :param cost_budget: The original dispatch's cost budget; the fallback
+        child gets the same ``subagent_cost_budget`` policy attached.
     :param fallback_targets: The full ordered target tuple (carried onto
         the new entry so its own failure can consume the next target).
     :param fallback_index: Index of the next target AFTER this one.
@@ -1875,18 +2059,15 @@ async def dispatch_subagent_fallback_target(
     :param fallback_note: Provenance note for the new entry's successful
         delivery.
     :param publish_event: Parent-stream event publisher, or ``None``.
-    :returns: ``None`` on success, or an error string describing why this
-        target could not be dispatched (the caller tries the next target).
+    :returns: The dispatch outcome; on error the caller tries the next
+        target.
     """
     # Lazy import to avoid circular dependency at module load.
     from omnigent.runner import app as _runner_app
 
-    model: str | None = None
-    if target.model is not None:
-        try:
-            model = validate_model_override(target.model)
-        except ValueError as exc:
-            return f"Error: invalid fallback model {target.model!r}: {exc}"
+    model, model_error = _validated_fallback_model(target)
+    if model_error is not None:
+        return FallbackDispatchResult(error=model_error, child_session_id=None)
 
     parent_agent_id = _runner_app.get_session_agent_id(parent_session_id)
     if parent_agent_id is None:
@@ -1900,29 +2081,9 @@ async def dispatch_subagent_fallback_target(
         except (httpx.HTTPError, RuntimeError):
             pass
     if parent_agent_id is None:
-        return "Error: cannot resolve parent agent_id for fallback dispatch"
-
-    # Free the (parent_conversation_id, title) unique slot held by the
-    # failed child, mirroring sys_session_close's title tombstone.
-    # Best-effort: if the PATCH fails, the create below fails loud on the
-    # unique index and this target is reported as undispatchable.
-    try:
-        await server_client.patch(
-            f"/v1/sessions/{superseded_child_session_id}",
-            json={
-                "title": (
-                    f"{sub_agent_name}:{session_name}"
-                    f"{_CLOSED_TITLE_INFIX}{superseded_child_session_id}"
-                ),
-                "labels": {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE},
-            },
-            timeout=10.0,
-        )
-    except httpx.HTTPError:
-        _logger.warning(
-            "fallback: failed to tombstone superseded child %s",
-            superseded_child_session_id,
-            exc_info=True,
+        return FallbackDispatchResult(
+            error="Error: cannot resolve parent agent_id for fallback dispatch",
+            child_session_id=None,
         )
 
     created = await _create_subagent_child_session(
@@ -1935,11 +2096,11 @@ async def dispatch_subagent_fallback_target(
         harness_override=target.harness,
         require_harness_allowlist=False,
         model=model,
-        cost_budget=None,
+        cost_budget=cost_budget,
     )
     if isinstance(created, str):
-        return created
-    return await _register_and_send_subagent_child(
+        return FallbackDispatchResult(error=created, child_session_id=None)
+    send_error = await _register_and_send_subagent_child(
         server_client=server_client,
         conversation_id=parent_session_id,
         parent_agent_id=str(parent_agent_id),
@@ -1952,12 +2113,30 @@ async def dispatch_subagent_fallback_target(
         publish_event=publish_event,
         active_harness=created.harness,
         active_model=created.model_override,
+        cost_budget=cost_budget,
         fallback_targets=fallback_targets,
         fallback_index=fallback_index,
         fallback_history=fallback_history,
         fallback_note=fallback_note,
         work_id=work_id,
     )
+    if send_error is not None:
+        # Close the just-created session so it doesn't squat on the
+        # (parent, title) slot — a later send would adopt the zombie.
+        cleanup_error = await tombstone_superseded_subagent_child(
+            server_client=server_client,
+            child_session_id=created.child_session_id,
+            sub_agent_name=sub_agent_name,
+            session_name=session_name,
+        )
+        if cleanup_error is not None:
+            _logger.warning(
+                "fallback: could not close undispatched replacement child %s: %s",
+                created.child_session_id,
+                cleanup_error,
+            )
+        return FallbackDispatchResult(error=send_error, child_session_id=None)
+    return FallbackDispatchResult(error=None, child_session_id=created.child_session_id)
 
 
 async def _send_to_existing_session(
@@ -6179,6 +6358,9 @@ async def _cancel_subagent_task(
         return 'Error: sys_cancel_task requires "task_id"'
     if conversation_id is None:
         return "Error: sys_cancel_task requires conversation_id"
+    # A cross-harness fallback superseded the handle the LLM holds; follow
+    # the supersession chain so the cancel reaches the live replacement.
+    task_id = _runner_app.resolve_superseded_subagent_child(str(task_id))
     entry = _runner_app.get_subagent_work(str(task_id))
     if entry is None or entry.parent_session_id != conversation_id:
         return f"Error: no in-flight task with task_id {task_id}"

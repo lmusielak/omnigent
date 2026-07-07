@@ -7147,9 +7147,12 @@ class _SubagentWorkEntry:
         the parent's inbox.
     :param message: Original user message text of this dispatch, retained
         so a cross-harness fallback can replay it on a fresh child.
+        ``None`` when fallback is not armed (continuation sends).
     :param active_harness: The child's effective harness at dispatch, e.g.
         ``"codex-native"``. Used for fallback provenance text.
     :param active_model: The child's persisted model override, if any.
+    :param cost_budget: The dispatch's cost-budget policy params, retained
+        so a fallback child inherits the same budget.
     :param fallback_targets: Ordered ``executor.config.fallback`` targets
         (:class:`omnigent.runner.tool_dispatch.FallbackTarget`) captured at
         dispatch time. Empty when the sub-agent declares none.
@@ -7175,6 +7178,7 @@ class _SubagentWorkEntry:
     message: str | None = None
     active_harness: str | None = None
     active_model: str | None = None
+    cost_budget: dict[str, Any] | None = None
     # tuple of tool_dispatch.FallbackTarget; typed loosely because app.py
     # and tool_dispatch import each other lazily.
     fallback_targets: tuple[Any, ...] = ()
@@ -7208,6 +7212,41 @@ class _SubagentDeliveryAck:
 _subagent_work_by_child: dict[str, _SubagentWorkEntry] = {}
 _subagent_work_by_parent: dict[str, set[str]] = {}
 _drained_delivered_subagent_children: set[str] = set()
+# In-flight cross-harness fallbacks: parent_session_id -> superseded child
+# ids whose replacement is not yet registered. During that window the work
+# is invisible to the registry, so the waiting/idle computation counts
+# these as running children (a parent must not go idle mid-fallback).
+_pending_subagent_fallbacks: dict[str, set[str]] = {}
+# Fallback supersessions: old child id -> replacement child id, so a stale
+# handle (sys_cancel_task) resolves to the live fallback child.
+_superseded_subagent_children_map: dict[str, str] = {}
+
+
+def record_subagent_supersession(old_child_id: str, new_child_id: str) -> None:
+    """
+    Record that a fallback replaced *old_child_id* with *new_child_id*.
+
+    :param old_child_id: The failed child, e.g. ``"conv_child456"``.
+    :param new_child_id: The replacement child, e.g. ``"conv_child789"``.
+    """
+    if old_child_id != new_child_id:
+        _superseded_subagent_children_map[old_child_id] = new_child_id
+
+
+def resolve_superseded_subagent_child(child_session_id: str) -> str:
+    """
+    Follow the fallback supersession chain to the live child handle.
+
+    :param child_session_id: A child handle the caller holds, possibly
+        superseded, e.g. ``"conv_child456"``.
+    :returns: The live descendant (or the input when never superseded).
+    """
+    seen: set[str] = set()
+    current = child_session_id
+    while current in _superseded_subagent_children_map and current not in seen:
+        seen.add(current)
+        current = _superseded_subagent_children_map[current]
+    return current
 
 
 def register_subagent_work(
@@ -7220,6 +7259,7 @@ def register_subagent_work(
     message: str | None = None,
     active_harness: str | None = None,
     active_model: str | None = None,
+    cost_budget: dict[str, Any] | None = None,
     fallback_targets: tuple[Any, ...] = (),
     fallback_index: int = 0,
     fallback_history: list[str] | None = None,
@@ -7244,6 +7284,7 @@ def register_subagent_work(
     :param active_harness: The child's effective harness, e.g.
         ``"codex-native"``.
     :param active_model: The child's persisted model override, if any.
+    :param cost_budget: The dispatch's cost-budget policy params, if any.
     :param fallback_targets: Cross-harness fallback targets captured from
         the sub-agent spec.
     :param fallback_index: Index of the next un-tried fallback target.
@@ -7272,6 +7313,7 @@ def register_subagent_work(
         message=message,
         active_harness=active_harness,
         active_model=active_model,
+        cost_budget=cost_budget,
         fallback_targets=tuple(fallback_targets),
         fallback_index=fallback_index,
         fallback_history=list(fallback_history or []),
@@ -7367,6 +7409,12 @@ def unregister_subagent_work_for_session(session_id: str) -> None:
         _subagent_work_by_child.pop(child_id, None)
         _drained_delivered_subagent_children.discard(child_id)
     _subagent_work_by_parent.pop(session_id, None)
+    _pending_subagent_fallbacks.pop(session_id, None)
+    # Purge supersession links touching the deleted session (small map).
+    _superseded_subagent_children_map.pop(session_id, None)
+    for old_id, new_id in list(_superseded_subagent_children_map.items()):
+        if new_id == session_id:
+            _superseded_subagent_children_map.pop(old_id, None)
 
 
 def list_subagent_work(parent_session_id: str) -> list[_SubagentWorkEntry]:
@@ -12909,7 +12957,9 @@ def create_runner_app(
                     (e := _subagent_work_by_child.get(c)) is not None
                     and e.status in ("launching", "running", "waiting")
                     for c in children
-                )
+                    # An in-flight fallback re-dispatch has no registered
+                    # entry yet; it still counts as running work.
+                ) or bool(_pending_subagent_fallbacks.get(conv_id))
                 _publish_turn_status(conv_id, "waiting" if has_running_children else "idle")
         if was_interrupted:
             _mark_subagent_terminal_and_wake(
@@ -13305,6 +13355,9 @@ def create_runner_app(
                     else classify_turn_error_kind(output)
                 )
                 remaining = entry.fallback_targets[entry.fallback_index :]
+                # First terminal report wins: whichever site classifies the
+                # failure first decides whether fallback engages; later
+                # duplicate reports ack as already delivered.
                 if any(kind in getattr(target, "on", ()) for target in remaining):
                     if _begin_subagent_fallback(entry, kind, output):
                         return _SubagentDeliveryAck(
@@ -13347,6 +13400,11 @@ def create_runner_app(
         # report for this child ack as already delivered.
         entry.delivered = True
         unregister_subagent_work(entry.child_session_id, remember_drained_delivery=True)
+        # Keep the parent visibly busy while the replacement is spawned:
+        # the registry has no entry for this work until re-registration.
+        _pending_subagent_fallbacks.setdefault(entry.parent_session_id, set()).add(
+            entry.child_session_id
+        )
         _logger.info(
             "sub-agent fallback: intercepting %s failure of %s (agent=%s title=%r); "
             "%d target(s) remain",
@@ -13370,13 +13428,16 @@ def create_runner_app(
         """
         Re-dispatch superseded sub-agent work on its next fallback target.
 
-        Walks ``entry.fallback_targets`` from ``entry.fallback_index``:
-        targets whose ``on`` excludes *error_kind* are passed over, and a
-        target that fails validation/spawn is recorded in the history and
-        the next one is tried. On success the fresh child carries the same
-        ``work_id`` with an incremented ``fallback_index`` (the loop
-        guard). When every target is exhausted, the ORIGINAL failure is
-        delivered to the parent inbox with the fallback history appended.
+        Walks ``entry.fallback_targets`` from ``entry.fallback_index``,
+        first validating every kind-matching candidate without I/O: a fully
+        undispatchable block delivers the original failure with the
+        original child untouched. Otherwise the failed child's title slot
+        is freed once (abort fail-safe on error), then each candidate is
+        spawned in order until one dispatches; the fresh child carries the
+        same ``work_id`` with an incremented ``fallback_index`` (the loop
+        guard). On exhaustion — or on ANY unexpected error, since the old
+        entry was already superseded and would otherwise vanish — the
+        ORIGINAL failure is delivered with the fallback history appended.
 
         :param entry: The superseded (already unregistered) work entry.
         :param error_kind: Classified failure kind, e.g. ``"quota"``.
@@ -13385,94 +13446,158 @@ def create_runner_app(
         """
         from omnigent.runner import tool_dispatch as _tool_dispatch
 
-        agent_spec: Any | None = None
-        try:
-            agent_spec = await _resolve_session_agent_spec(entry.parent_session_id)
-        except Exception:  # noqa: BLE001 — validation degrades gracefully without a spec
-            _logger.warning(
-                "sub-agent fallback: could not resolve parent spec for %s",
-                entry.parent_session_id,
-                exc_info=True,
-            )
-        failed_on = entry.active_harness or "primary harness"
-        reason_phrase = {
-            "quota": "quota limit",
-            "auth": "auth failure",
-        }.get(error_kind, f"{error_kind} failure")
         history = list(entry.fallback_history)
         targets = entry.fallback_targets
-        index = entry.fallback_index
-        while index < len(targets):
-            target = targets[index]
-            index += 1
-            if error_kind not in getattr(target, "on", ()):
-                continue
-            label = target.harness + (f"/{target.model}" if target.model else "")
-            attempt_history = [
-                *history,
-                f"{failed_on} failed: {error_kind} — retrying on {label}",
-            ]
-            error = await _tool_dispatch.dispatch_subagent_fallback_target(
-                server_client=server_client,
+        original_failure_delivered = False
+
+        def _target_label(target: Any) -> str:
+            return target.harness + (f"/{target.model}" if target.model else "")
+
+        def _deliver_original_failure() -> None:
+            # Re-register the old child's entry with the index parked past
+            # the end (no re-entry into the fallback engine) and route
+            # through the normal terminal+wake path, which appends the
+            # accumulated history to the delivered output.
+            nonlocal original_failure_delivered
+            if original_failure_delivered:
+                return
+            original_failure_delivered = True
+            register_subagent_work(
                 parent_session_id=entry.parent_session_id,
-                agent_spec=agent_spec,
+                child_session_id=entry.child_session_id,
+                agent=entry.agent,
+                title=entry.title,
+                wrapper_label=entry.wrapper_label,
+                message=entry.message,
+                active_harness=entry.active_harness,
+                active_model=entry.active_model,
+                cost_budget=entry.cost_budget,
+                fallback_targets=targets,
+                fallback_index=len(targets),
+                fallback_history=history,
+                work_id=entry.work_id,
+            )
+            _mark_subagent_terminal_and_wake(
+                entry.child_session_id,
+                status="failed",
+                output=failure_output,
+            )
+
+        try:
+            agent_spec: Any | None = None
+            try:
+                agent_spec = await _resolve_session_agent_spec(entry.parent_session_id)
+            except Exception:  # noqa: BLE001 — validation degrades gracefully without a spec
+                _logger.warning(
+                    "sub-agent fallback: could not resolve parent spec for %s",
+                    entry.parent_session_id,
+                    exc_info=True,
+                )
+            failed_on = entry.active_harness or "primary harness"
+            reason_phrase = {
+                "quota": "quota limit",
+                "auth": "auth failure",
+            }.get(error_kind, f"{error_kind} failure")
+            # Validate all kind-matching candidates BEFORE any server-side
+            # mutation, so an undispatchable block changes nothing.
+            candidates: list[tuple[int, Any]] = []
+            index = entry.fallback_index
+            while index < len(targets):
+                target = targets[index]
+                index += 1
+                if error_kind not in getattr(target, "on", ()):
+                    continue
+                invalid = _tool_dispatch.validate_subagent_fallback_target(
+                    target=target,
+                    sub_agent_name=entry.agent,
+                    agent_spec=agent_spec,
+                )
+                if invalid is not None:
+                    _logger.warning(
+                        "sub-agent fallback: target %s undispatchable for work %s: %s",
+                        _target_label(target),
+                        entry.work_id,
+                        invalid,
+                    )
+                    history.append(f"fallback target {_target_label(target)} skipped: {invalid}")
+                    continue
+                candidates.append((index, target))
+            if not candidates:
+                _deliver_original_failure()
+                return
+            # Free the failed child's (parent, title) slot once. A failed
+            # tombstone means every create would hit the unique index, so
+            # abort fail-safe and deliver the original failure.
+            tombstone_error = await _tool_dispatch.tombstone_superseded_subagent_child(
+                server_client=server_client,
+                child_session_id=entry.child_session_id,
                 sub_agent_name=entry.agent,
                 session_name=entry.title,
-                message=entry.message or "",
-                target=target,
-                superseded_child_session_id=entry.child_session_id,
-                work_id=entry.work_id,
-                fallback_targets=targets,
-                fallback_index=index,
-                fallback_history=attempt_history,
-                fallback_note=(
-                    f"[fallback: completed on {label} after {failed_on} {reason_phrase}]"
-                ),
-                publish_event=_publish_event,
             )
-            if error is None:
-                _logger.info(
-                    "sub-agent fallback: re-dispatched work %s (agent=%s title=%r) "
-                    "on %s after %s %s",
-                    entry.work_id,
-                    entry.agent,
-                    entry.title,
-                    label,
-                    failed_on,
-                    reason_phrase,
-                )
+            if tombstone_error is not None:
+                history.append(f"[fallback dispatch failed: {tombstone_error}]")
+                _deliver_original_failure()
                 return
-            _logger.warning(
-                "sub-agent fallback: target %s undispatchable for work %s: %s",
-                label,
+            for next_index, target in candidates:
+                label = _target_label(target)
+                attempt_history = [
+                    *history,
+                    f"{failed_on} failed: {error_kind} — retrying on {label}",
+                ]
+                result = await _tool_dispatch.dispatch_subagent_fallback_target(
+                    server_client=server_client,
+                    parent_session_id=entry.parent_session_id,
+                    agent_spec=agent_spec,
+                    sub_agent_name=entry.agent,
+                    session_name=entry.title,
+                    message=entry.message or "",
+                    target=target,
+                    work_id=entry.work_id,
+                    cost_budget=entry.cost_budget,
+                    fallback_targets=targets,
+                    fallback_index=next_index,
+                    fallback_history=attempt_history,
+                    fallback_note=(
+                        f"[fallback: completed on {label} after {failed_on} {reason_phrase}]"
+                    ),
+                    publish_event=_publish_event,
+                )
+                if result.error is None and result.child_session_id:
+                    record_subagent_supersession(entry.child_session_id, result.child_session_id)
+                    _logger.info(
+                        "sub-agent fallback: re-dispatched work %s (agent=%s title=%r) "
+                        "on %s after %s %s",
+                        entry.work_id,
+                        entry.agent,
+                        entry.title,
+                        label,
+                        failed_on,
+                        reason_phrase,
+                    )
+                    return
+                _logger.warning(
+                    "sub-agent fallback: target %s failed to dispatch for work %s: %s",
+                    label,
+                    entry.work_id,
+                    result.error,
+                )
+                history.append(f"fallback target {label} skipped: {result.error}")
+            _deliver_original_failure()
+        except Exception as exc:
+            _logger.exception(
+                "sub-agent fallback: dispatch crashed for work %s (agent=%s title=%r)",
                 entry.work_id,
-                error,
+                entry.agent,
+                entry.title,
             )
-            history.append(f"fallback target {label} skipped: {error}")
-        # Exhausted (or nothing matched after skips): deliver the ORIGINAL
-        # failure. Re-register the old child's entry — with the index parked
-        # past the end so this report can't re-enter the fallback engine —
-        # and route through the normal terminal+wake path, which appends the
-        # accumulated history to the delivered output.
-        register_subagent_work(
-            parent_session_id=entry.parent_session_id,
-            child_session_id=entry.child_session_id,
-            agent=entry.agent,
-            title=entry.title,
-            wrapper_label=entry.wrapper_label,
-            message=entry.message,
-            active_harness=entry.active_harness,
-            active_model=entry.active_model,
-            fallback_targets=targets,
-            fallback_index=len(targets),
-            fallback_history=history,
-            work_id=entry.work_id,
-        )
-        _mark_subagent_terminal_and_wake(
-            entry.child_session_id,
-            status="failed",
-            output=failure_output,
-        )
+            history.append(f"[fallback dispatch failed: {type(exc).__name__}: {exc}]")
+            _deliver_original_failure()
+        finally:
+            pending = _pending_subagent_fallbacks.get(entry.parent_session_id)
+            if pending is not None:
+                pending.discard(entry.child_session_id)
+                if not pending:
+                    _pending_subagent_fallbacks.pop(entry.parent_session_id, None)
 
     async def _ensure_comment_relay_started(
         session_id: str,

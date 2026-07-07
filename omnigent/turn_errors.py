@@ -22,18 +22,22 @@ TURN_ERROR_KINDS: frozenset[str] = frozenset(
 )
 
 # Case-insensitive substrings that mark a quota / rate-limit failure.
-# Covers Codex ("usage limit", "usage_limit_exceeded"), Anthropic/Claude
-# ("hit your limit", the 5-hour-window wording, "rate limit"), and the
-# generic provider spellings ("429", "quota exceeded", "rate-limited").
+# Anchored phrases only: a false quota positive re-dispatches the work and
+# duplicates side effects, so bare "429" (matches "14290 tokens", request
+# ids) and bare "rate limit" are excluded — a real 429 classifies via the
+# structured ``code`` argument instead.
 QUOTA_ERROR_FRAGMENTS: tuple[str, ...] = (
     "usage_limit_exceeded",
+    "usage_limit_reached",
     "usage limit",
     "usage-limit",
     "hit your limit",
     "reached your limit",
-    "rate limit",
-    "rate-limit",
-    "rate_limit",
+    "rate limit exceeded",
+    "rate limit reached",
+    "rate-limited",
+    "rate_limited",
+    "rate_limit_exceeded",
     "quota exceeded",
     "quota_exceeded",
     "insufficient_quota",
@@ -45,7 +49,6 @@ QUOTA_ERROR_FRAGMENTS: tuple[str, ...] = (
     "5 hour limit",
     "limit will reset",
     "limit resets",
-    "429",
 )
 
 # Case-insensitive substrings that mark an authentication failure.
