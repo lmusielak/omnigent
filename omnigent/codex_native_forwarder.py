@@ -50,6 +50,13 @@ from omnigent.codex_native_elicitation import (
     is_codex_request_id as _is_codex_request_id,
 )
 from omnigent.entities.session_resources import terminal_resource_id
+from omnigent.turn_errors import (
+    AUTH_ERROR_FRAGMENTS,
+    QUOTA_ERROR_FRAGMENTS,
+    TURN_ERROR_KIND_AUTH,
+    TURN_ERROR_KIND_GENERIC,
+    TURN_ERROR_KIND_QUOTA,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -170,30 +177,20 @@ _CODEX_ELICITATION_REQUEST_METHODS = frozenset(
 _CODEX_ERROR_ITEM_TYPE = "error"
 _CODEX_AUTH_ERROR_INFO = frozenset({"unauthorized"})
 _CODEX_AUTH_HTTP_STATUS = frozenset({401, 403})
+# Structured codexErrorInfo variants / status for a usage-quota failure.
+_CODEX_QUOTA_ERROR_INFO = frozenset(
+    {"usage_limit_exceeded", "usage_limit_reached", "rate_limit_exceeded", "rate_limited"}
+)
+_CODEX_QUOTA_HTTP_STATUS = frozenset({429})
 # Message-substring fallback for app-server versions that omit codexErrorInfo.
 # Surface-only, so recall is favored over precision: a false positive only
-# appends a re-auth hint to an already-failed turn.
-_CODEX_AUTH_ERROR_FRAGMENTS = (
-    "401",
-    "403",
-    "unauthorized",
-    "authentication",
-    "not logged in",
-    "not authenticated",
-    "log in",
-    "login",
-    "sign in",
-    "re-authenticate",
-    "reauthenticate",
-    "credentials",
-    "access token",
-    "token expired",
-    "expired token",
-    "session expired",
-    "api key",
-)
-_CODEX_ERROR_KIND_AUTH = "auth"
-_CODEX_ERROR_KIND_GENERIC = "generic"
+# appends a re-auth hint to an already-failed turn. Shared with the runner's
+# cross-harness classifier so both sides agree on what counts as auth/quota.
+_CODEX_AUTH_ERROR_FRAGMENTS = AUTH_ERROR_FRAGMENTS
+_CODEX_QUOTA_ERROR_FRAGMENTS = QUOTA_ERROR_FRAGMENTS
+_CODEX_ERROR_KIND_AUTH = TURN_ERROR_KIND_AUTH
+_CODEX_ERROR_KIND_QUOTA = TURN_ERROR_KIND_QUOTA
+_CODEX_ERROR_KIND_GENERIC = TURN_ERROR_KIND_GENERIC
 _CODEX_REAUTH_HINT = "Codex needs you to re-authenticate. Run `codex login` and retry."
 
 
@@ -778,7 +775,7 @@ class _CodexTerminalError:
 
     :param message: Human-readable error text, e.g.
         ``"401 Unauthorized: ChatGPT login expired"``.
-    :param kind: Classification, either ``"auth"`` or ``"generic"``.
+    :param kind: Classification: ``"auth"``, ``"quota"``, or ``"generic"``.
     """
 
     message: str
@@ -792,17 +789,19 @@ class _CodexTerminalError:
 
 def _classify_codex_error(error: dict[str, Any], message: str) -> str:
     """
-    Classify a Codex ``turn.error`` / ``error`` item as auth-related or generic.
+    Classify a Codex ``turn.error`` / ``error`` item as auth, quota, or generic.
 
-    Prefers the structured ``codexErrorInfo`` (an ``unauthorized`` variant,
-    case-insensitive, or an httpStatusCode of 401/403); falls back to substring
-    matching against :data:`_CODEX_AUTH_ERROR_FRAGMENTS` for versions/shapes
-    that omit it.
+    Prefers the structured ``codexErrorInfo`` (an ``unauthorized`` variant or
+    httpStatusCode 401/403 is auth; a ``usage_limit_exceeded`` / rate-limit
+    variant or httpStatusCode 429 is quota, all case-insensitive); falls back
+    to substring matching against :data:`_CODEX_AUTH_ERROR_FRAGMENTS` then
+    :data:`_CODEX_QUOTA_ERROR_FRAGMENTS` for versions/shapes that omit it
+    (auth first, preserving the pre-quota classification for auth messages).
 
     :param error: The ``turn.error`` object.
     :param message: Its already-extracted message text.
-    :returns: :data:`_CODEX_ERROR_KIND_AUTH` or
-        :data:`_CODEX_ERROR_KIND_GENERIC`.
+    :returns: :data:`_CODEX_ERROR_KIND_AUTH`, :data:`_CODEX_ERROR_KIND_QUOTA`,
+        or :data:`_CODEX_ERROR_KIND_GENERIC`.
     """
     info = error.get("codexErrorInfo")
     variant: str | None = None
@@ -815,9 +814,14 @@ def _classify_codex_error(error: dict[str, Any], message: str) -> str:
     variant_is_auth = variant is not None and variant.lower() in _CODEX_AUTH_ERROR_INFO
     if variant_is_auth or http_status in _CODEX_AUTH_HTTP_STATUS:
         return _CODEX_ERROR_KIND_AUTH
+    variant_is_quota = variant is not None and variant.lower() in _CODEX_QUOTA_ERROR_INFO
+    if variant_is_quota or http_status in _CODEX_QUOTA_HTTP_STATUS:
+        return _CODEX_ERROR_KIND_QUOTA
     lowered = message.lower()
     if any(fragment in lowered for fragment in _CODEX_AUTH_ERROR_FRAGMENTS):
         return _CODEX_ERROR_KIND_AUTH
+    if any(fragment in lowered for fragment in _CODEX_QUOTA_ERROR_FRAGMENTS):
+        return _CODEX_ERROR_KIND_QUOTA
     return _CODEX_ERROR_KIND_GENERIC
 
 
@@ -5142,6 +5146,7 @@ async def _post_status(
     response_id: str | None = None,
     output: str | None = None,
     reauth_required: bool = False,
+    error_kind: str | None = None,
 ) -> None:
     """
     Publish a native Codex status edge.
@@ -5157,6 +5162,10 @@ async def _post_status(
     :param reauth_required: When ``True``, mark a ``failed`` edge as caused by
         an authentication error so the surface can prompt a re-auth.
         Surface-only: no automatic ``codex login`` is triggered.
+    :param error_kind: Optional error classification carried with a
+        ``failed`` edge (``"auth"`` / ``"quota"`` / ``"generic"``) so the
+        runner's cross-harness fallback keys off the structured Codex
+        verdict instead of re-parsing the message text.
     :returns: None.
     """
     data: dict[str, Any] = {"status": status}
@@ -5166,6 +5175,8 @@ async def _post_status(
         data["output"] = output
     if reauth_required:
         data["reauth_required"] = True
+    if error_kind is not None:
+        data["error_kind"] = error_kind
     response = await _post_session_event(
         client,
         session_id,
@@ -5205,8 +5216,10 @@ async def _post_turn_status_edge(
     response_id = _response_id(_params_with_turn_id({}, edge.turn_id)) if edge.turn_id else None
     output: str | None = None
     reauth_required = False
+    error_kind: str | None = None
     if edge.error is not None:
         output = edge.error.message
+        error_kind = edge.error.kind
         if edge.error.is_auth:
             reauth_required = True
             output = f"{output}\n\n{_CODEX_REAUTH_HINT}"
@@ -5217,6 +5230,7 @@ async def _post_turn_status_edge(
         response_id=response_id,
         output=output,
         reauth_required=reauth_required,
+        error_kind=error_kind,
     )
 
 

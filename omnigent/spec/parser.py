@@ -88,8 +88,11 @@ _BOOL_TAG = "tag:yaml.org,2002:bool"
 _YAML_1_2_BOOL_RE = re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$")
 
 # ``executor.config`` keys kept as their nested YAML structure instead of
-# string-coerced — their consumers read the nested mapping/list shape.
-_STRUCTURED_EXECUTOR_CONFIG_KEYS = frozenset({"cost_optimize"})
+# string-coerced — their consumers read the nested mapping/list shape:
+# ``cost_optimize`` (cost-advisor tier mapping), ``allowed_harnesses``
+# (harness-override allowlist read as a list by the sub-agent dispatch),
+# and ``fallback`` (cross-harness fallback target mapping/list).
+_STRUCTURED_EXECUTOR_CONFIG_KEYS = frozenset({"cost_optimize", "allowed_harnesses", "fallback"})
 for _ch in list(_ConfigYamlLoader.yaml_implicit_resolvers.keys()):
     _ConfigYamlLoader.yaml_implicit_resolvers[_ch] = [
         (tag, regexp)
@@ -513,8 +516,9 @@ def _parse_executor(
     # numbers round-trip as their string form (the omnigent
     # harness/profile fields are both strings in the source YAML).
     # Structured keys whose consumer needs the nested shape are kept
-    # verbatim: ``cost_optimize`` is the cost advisor's tier config (a
-    # nested mapping), which ``parse_advisor_config`` reads as a Mapping.
+    # verbatim (see _STRUCTURED_EXECUTOR_CONFIG_KEYS): the cost advisor's
+    # ``cost_optimize`` mapping, the sub-agent dispatch's
+    # ``allowed_harnesses`` list, and the cross-harness ``fallback`` block.
     raw_config = raw.get("config")
     config: dict[str, Any] = {}
     if isinstance(raw_config, dict):

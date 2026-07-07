@@ -295,6 +295,42 @@ tools:
 Use `tools.<name>: inherit` to inherit a tool from a parent agent, or
 `tools.<name>: self` / `spec: self` for a sub-agent that clones the parent spec.
 
+### Per-dispatch harness overrides and cross-harness fallback
+
+Two optional `executor.config` keys on a sub-agent control which harnesses
+its work may run on beyond the declared `harness`:
+
+```yaml
+executor:
+  config:
+    harness: codex-native
+    # Opt-in allowlist for a per-dispatch `args.harness` override on
+    # sys_session_send. Without this key, override requests are rejected.
+    allowed_harnesses:
+      - codex-native
+      - pi
+    # Cross-harness fallback: when a turn terminally fails with a matching
+    # error kind, the runner spawns a FRESH child session on the fallback
+    # harness (model/harness are create-time-only), replays the original
+    # message, and delivers the result under the original work id. One
+    # mapping or an ordered list; targets are tried in order, each at most
+    # once per piece of work.
+    fallback:
+      - harness: pi                      # required
+        model: google/gemini-2.5-pro     # optional; harness default when omitted
+        on: [quota]                      # optional; "quota" | "auth" | "generic"
+                                         # (defaults to [quota])
+```
+
+The fallback sits ABOVE the per-harness `retry:` policy (which retries
+transport-level request failures within one harness) and the executor's own
+turn handling: it only activates after a turn has terminally failed, and it
+never re-tries the same target. On success the delivered output is prefixed
+with a provenance note, e.g.
+`[fallback: completed on pi/google/gemini-2.5-pro after codex-native quota limit]`;
+when every target is exhausted or none matches the error kind, the original
+failure is delivered with the fallback history appended.
+
 ## Policies
 
 Policies can inspect requests, responses, tool calls, and tool results.

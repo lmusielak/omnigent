@@ -1840,3 +1840,80 @@ async def test_post_session_event_records_connectivity_failure_for_watchdog(
         assert "No route to host" in detail
     finally:
         health.clear()
+
+
+def test_classify_codex_error_quota() -> None:
+    """Usage-limit / rate-limit failures classify as ``quota``, not generic.
+
+    The cross-harness fallback engine keys off this kind to re-dispatch a
+    quota-starved sub-agent on a fallback harness; collapsing these into
+    ``generic`` (the pre-fallback behavior) would make the fallback block a
+    no-op exactly when it matters.
+    """
+    quota = fwd._CODEX_ERROR_KIND_QUOTA
+    auth = fwd._CODEX_ERROR_KIND_AUTH
+    # Structured codexErrorInfo: variant string, tagged object, http status.
+    assert fwd._classify_codex_error({"codexErrorInfo": "usage_limit_exceeded"}, "nope") == quota
+    assert (
+        fwd._classify_codex_error({"codexErrorInfo": {"type": "Usage_Limit_Exceeded"}}, "nope")
+        == quota
+    )
+    assert fwd._classify_codex_error({"codexErrorInfo": {"httpStatusCode": 429}}, "nope") == quota
+    # Message-text fallback when codexErrorInfo is absent.
+    assert fwd._classify_codex_error({}, "You've hit your usage limit.") == quota
+    assert fwd._classify_codex_error({}, "Rate limit exceeded, retry later") == quota
+    assert fwd._classify_codex_error({}, "HTTP 429 Too Many Requests") == quota
+    # Auth classification is unchanged: auth fragments still win the
+    # message fallback, and structured auth beats structured quota.
+    assert fwd._classify_codex_error({}, "Please run codex login") == auth
+    assert (
+        fwd._classify_codex_error(
+            {"codexErrorInfo": {"type": "unauthorized", "httpStatusCode": 401}},
+            "rate limit",
+        )
+        == auth
+    )
+
+
+@pytest.mark.asyncio
+async def test_post_turn_status_edge_carries_error_kind() -> None:
+    """A failed edge's ``external_session_status`` payload carries ``error_kind``.
+
+    The runner's fallback engine prefers the forwarder's structured verdict
+    over re-parsing the message text, so the classified kind must survive
+    into the POSTed event data.
+    """
+    client = _RecordingClient()
+    edge = fwd._CodexTurnStatusEdge(
+        status="failed",
+        turn_id=None,
+        source="turn/completed:turn-error",
+        error=fwd._CodexTerminalError(
+            message="You've hit your usage limit.",
+            kind=fwd._CODEX_ERROR_KIND_QUOTA,
+        ),
+    )
+
+    await fwd._post_turn_status_edge(client, "conv_x", edge)  # type: ignore[arg-type]
+
+    assert len(client.posts) == 1
+    _url, body = client.posts[0]
+    assert body["type"] == "external_session_status"
+    assert body["data"]["status"] == "failed"
+    assert body["data"]["error_kind"] == "quota"
+    assert body["data"]["output"] == "You've hit your usage limit."
+    # Quota is not auth: no re-auth flag or hint.
+    assert "reauth_required" not in body["data"]
+
+
+@pytest.mark.asyncio
+async def test_post_turn_status_edge_without_error_omits_error_kind() -> None:
+    """A clean idle edge posts no ``error_kind`` key."""
+    client = _RecordingClient()
+    edge = fwd._CodexTurnStatusEdge(status="idle", turn_id=None, source="turn/completed")
+
+    await fwd._post_turn_status_edge(client, "conv_x", edge)  # type: ignore[arg-type]
+
+    assert len(client.posts) == 1
+    _url, body = client.posts[0]
+    assert "error_kind" not in body["data"]

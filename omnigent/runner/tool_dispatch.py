@@ -1075,6 +1075,81 @@ def _subagent_allowed_harnesses(sub_agent_name: str, agent_spec: Any | None) -> 
     )
 
 
+@dataclass(frozen=True)
+class FallbackTarget:
+    """
+    One cross-harness fallback destination from ``executor.config.fallback``.
+
+    :param harness: Harness id to re-dispatch on, alias or canonical,
+        e.g. ``"pi"``.
+    :param model: Optional model override for the fallback child, e.g.
+        ``"google/gemini-2.5-pro"``. ``None`` uses the harness default.
+    :param on: Error kinds this target covers, a subset of
+        :data:`omnigent.turn_errors.TURN_ERROR_KINDS`.
+    """
+
+    harness: str
+    model: str | None = None
+    on: frozenset[str] = frozenset({"quota"})
+
+
+def _subagent_fallback_targets(sub_spec: Any | None) -> tuple[FallbackTarget, ...]:
+    """
+    Read the ordered cross-harness fallback targets from a sub-agent spec.
+
+    Reads ``executor.config.fallback`` — either one mapping or an ordered
+    list of mappings, each ``{harness: str, model: str?, on: [str]?}``
+    (``on`` defaults to ``["quota"]``). Mirrors the dict-or-attr config
+    access of :func:`_subagent_allowed_harnesses`. Malformed entries are
+    skipped, never raised: a bad fallback block must not break normal
+    dispatch of the sub-agent itself.
+
+    :param sub_spec: The sub-agent's spec (or structural equivalent),
+        e.g. from :func:`_find_subagent_spec`. ``None`` yields no targets.
+    :returns: The declared fallback targets in order (empty when absent).
+    """
+    from omnigent.turn_errors import TURN_ERROR_KINDS
+
+    if sub_spec is None:
+        return ()
+    executor = getattr(sub_spec, "executor", None)
+    config = getattr(executor, "config", None)
+    raw: Any = None
+    if isinstance(config, dict):
+        raw = config.get("fallback")
+    elif config is not None:
+        raw = getattr(config, "fallback", None)
+    if isinstance(raw, dict):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        return ()
+    targets: list[FallbackTarget] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        harness = entry.get("harness")
+        if not isinstance(harness, str) or not harness.strip():
+            continue
+        model_raw = entry.get("model")
+        model = model_raw.strip() if isinstance(model_raw, str) and model_raw.strip() else None
+        raw_on = entry.get("on")
+        if raw_on is None:
+            on = frozenset({"quota"})
+        else:
+            if isinstance(raw_on, str):
+                raw_on = [raw_on]
+            if not isinstance(raw_on, (list, tuple, set, frozenset)):
+                continue
+            on = frozenset(
+                kind.strip().lower() for kind in raw_on if isinstance(kind, str) and kind.strip()
+            )
+            on = on & TURN_ERROR_KINDS
+            if not on:
+                continue
+        targets.append(FallbackTarget(harness=harness.strip(), model=model, on=on))
+    return tuple(targets)
+
+
 def _normalize_subagent_model(
     model: str,
     *,
@@ -1290,6 +1365,8 @@ async def _execute_subagent_tool(
         return existing
     created_child = False
     child_wrapper_label: str | None = None
+    child_harness = _subagent_harness(str(sub_agent_name), agent_spec)
+    child_model_override: str | None = None
     if existing is not None:
         child_session_id = existing.get("id")
         if not isinstance(child_session_id, str) or not child_session_id:
@@ -1331,146 +1408,327 @@ async def _execute_subagent_tool(
                 "is already running; wait for completion before sending again"
             )
     else:
-        child_harness = _subagent_harness(str(sub_agent_name), agent_spec)
-        # Apply an allowlisted per-dispatch harness override. The sub-agent
-        # spec must explicitly opt in via executor.config.allowed_harnesses,
-        # and the requested harness must canonicalize into OMNIGENT_HARNESSES.
-        # NOTE: the server create route (``_validated_harness_override`` in
-        # server/routes/sessions.py) independently re-validates a session-create
-        # override against the GLOBAL ``OMNIGENT_HARNESSES`` (plus the omnigent
-        # executor-type rule), but it does NOT re-check the per-spec
-        # ``allowed_harnesses`` allowlist. So this orchestrator-dispatch check is
-        # the sole enforcement of that per-spec allowlist; a direct
-        # ``POST /v1/sessions`` harness_override is bounded only by the global
-        # allowlist.
-        harness_override_canonical: str | None = None
-        if harness_override is not None:
-            from omnigent.spec._omnigent_compat import OMNIGENT_HARNESSES
-
-            canonical = canonicalize_harness(harness_override) or harness_override
-            allowed = _subagent_allowed_harnesses(str(sub_agent_name), agent_spec)
-            if not allowed:
-                return (
-                    f"Error: sys_session_send 'harness' override is not "
-                    f"permitted for sub-agent {sub_agent_name!r}: its spec "
-                    "declares no executor.config.allowed_harnesses allowlist."
-                )
-            if canonical not in allowed:
-                return (
-                    f"Error: sys_session_send 'harness' {harness_override!r} is "
-                    f"not allowlisted for sub-agent {sub_agent_name!r}: allowed "
-                    f"harnesses are {sorted(allowed)}."
-                )
-            if canonical not in OMNIGENT_HARNESSES:
-                return (
-                    f"Error: sys_session_send 'harness' {harness_override!r} is "
-                    f"not a known harness; must be one of {sorted(OMNIGENT_HARNESSES)}."
-                )
-            harness_override_canonical = canonical
-            child_harness = canonical
-        # Fail loud at dispatch when the child's harness needs a CLI binary
-        # that isn't on PATH. Otherwise a missing CLI surfaces only as a lazy
-        # first-turn failure (e.g. the pi harness raises ImportError, which the
-        # parent sees as a generic "turn failed" inbox item that hides the
-        # cause), and the orchestrator may re-dispatch into the same wall. The
-        # which-probe here reads the same PATH the harness boot uses, so the
-        # verdict can't disagree with the real launch.
-        from omnigent.onboarding.harness_install import missing_harness_cli
-
-        if child_harness is not None:
-            missing_cli = missing_harness_cli(child_harness)
-            if missing_cli is not None:
-                # Non-npm CLIs (e.g. cursor-agent) carry an ``install_hint``
-                # instead of a ``package``; using the hint avoids an
-                # ``npm install -g None`` instruction.
-                install = (
-                    f"npm install -g {missing_cli.package}"
-                    if missing_cli.package
-                    else (missing_cli.install_hint or "see the harness's install docs")
-                )
-                return (
-                    f"Error: sub-agent {sub_agent_name!r} can't start on this "
-                    f"machine: harness {child_harness!r} needs the "
-                    f"{missing_cli.binary!r} CLI on PATH, which was not found. "
-                    f"Install it with: {install} "
-                    f"(or don't dispatch to {sub_agent_name!r} here)."
-                )
-        # Create child session on the server (no initial items —
-        # those go via a separate POST so the server forwards them
-        # to the runner and triggers a turn).
-        create_body: dict[str, Any] = {
-            "agent_id": parent_agent_id,
-            "parent_session_id": conversation_id,
-            "title": f"{sub_agent_name}:{session_name}",
-            "sub_agent_name": sub_agent_name,
-        }
-        if harness_override_canonical is not None:
-            create_body["harness_override"] = harness_override_canonical
-        if model is not None:
-            # Reject up front when the child harness would silently
-            # ignore the persisted override — no silent drops.
-            if not harness_supports_model_override(child_harness):
-                return (
-                    f"Error: sys_session_send 'model' is not supported for "
-                    f"sub-agent {sub_agent_name!r}: harness "
-                    f"{child_harness or 'unknown'!r} has no model-override "
-                    "plumbing. Omit 'model' to use the harness default."
-                )
-            mismatch = model_family_mismatch(child_harness, model) if child_harness else None
-            if mismatch is not None:
-                return (
-                    f"Error: sys_session_send 'model' rejected for sub-agent "
-                    f"{sub_agent_name!r}: {mismatch}"
-                )
-            # Family guard first (on the requested id, so the error
-            # quotes what the caller sent), then mechanical
-            # canonical<->gateway-local normalization. The normalized
-            # id is what the server persists as model_override.
-            create_body["model_override"] = _normalize_subagent_model(
-                model,
-                sub_agent_name=str(sub_agent_name),
-                agent_spec=agent_spec,
-                harness=child_harness,
-            )
-        resp = await server_client.post("/v1/sessions", json=create_body, timeout=30.0)
-        if resp.status_code >= 400:
-            return f"Error: failed to create child session: {resp.status_code} {resp.text[:200]}"
-        child_data = resp.json()
-        child_session_id = child_data.get("session_id") or child_data.get("id")
-        if not child_session_id:
-            return "Error: server did not return child session_id"
-        child_wrapper_label = _session_wrapper_label(child_data)
+        created = await _create_subagent_child_session(
+            server_client=server_client,
+            conversation_id=conversation_id,
+            parent_agent_id=parent_agent_id,
+            agent_spec=agent_spec,
+            sub_agent_name=str(sub_agent_name),
+            session_name=session_name,
+            harness_override=harness_override,
+            require_harness_allowlist=True,
+            model=model,
+            cost_budget=cost_budget,
+        )
+        if isinstance(created, str):
+            return created
+        child_session_id = created.child_session_id
+        child_wrapper_label = created.wrapper_label
+        child_harness = created.harness
+        child_model_override = created.model_override
         created_child = True
 
-        # Attach a subagent_cost_budget policy to the child when requested.
-        # Non-fatal: the child session is still usable without the budget.
-        if cost_budget is not None:
-            policy_body = {
-                "name": "__subagent_cost_budget",
-                "type": "python",
-                "handler": "omnigent.policies.builtins.cost.subagent_cost_budget",
-                "factory_params": cost_budget,  # Dict with max_cost_usd and/or ask_thresholds_usd
-                "enabled": True,
-            }
-            try:
-                pol_resp = await server_client.post(
-                    f"/v1/sessions/{child_session_id}/policies",
-                    json=policy_body,
-                    timeout=10.0,
-                )
-                if pol_resp.status_code >= 400:
-                    _logger.warning(
-                        "failed to set subagent_cost_budget policy on child %s: %s %s",
-                        child_session_id,
-                        pol_resp.status_code,
-                        pol_resp.text[:200],
-                    )
-            except httpx.HTTPError:
+    send_error = await _register_and_send_subagent_child(
+        server_client=server_client,
+        conversation_id=conversation_id,
+        parent_agent_id=parent_agent_id,
+        child_session_id=child_session_id,
+        sub_agent_name=str(sub_agent_name),
+        session_name=session_name,
+        message=str(message),
+        child_wrapper_label=child_wrapper_label,
+        created_child=created_child,
+        publish_event=publish_event,
+        active_harness=child_harness,
+        active_model=child_model_override,
+        fallback_targets=_subagent_fallback_targets(
+            _find_subagent_spec(str(sub_agent_name), agent_spec)
+        ),
+    )
+    if send_error is not None:
+        return send_error
+
+    # Return the structured handle mirrored from ``spawn.py``. The debug panel
+    # parses this to discover child sessions in the sidebar.
+    return json.dumps(
+        {
+            "task_id": child_session_id,
+            "handle_id": child_session_id,
+            "conversation_id": child_session_id,
+            "kind": "sub_agent",
+            "agent": sub_agent_name,
+            "title": session_name,
+            "status": "launching",
+            "message": (
+                f"[System: sub-agent {sub_agent_name} title {session_name!r} "
+                f"launching as task {child_session_id}. Result will appear in "
+                "your inbox; call sys_read_inbox to check or sys_cancel_task "
+                "to interrupt it.]"
+            ),
+        }
+    )
+
+
+@dataclass(frozen=True)
+class _CreatedSubagentChild:
+    """
+    A freshly created (not yet messaged) child session.
+
+    :param child_session_id: Server-assigned child session id,
+        e.g. ``"conv_child456"``.
+    :param wrapper_label: The child's ``omnigent.wrapper`` label, e.g.
+        ``"codex-native-ui"``, or ``None``.
+    :param harness: The child's effective harness (spec harness or the
+        applied override), e.g. ``"codex-native"``; ``None`` if unknown.
+    :param model_override: The normalized model override persisted on the
+        child, or ``None`` when no model was requested.
+    """
+
+    child_session_id: str
+    wrapper_label: str | None
+    harness: str | None
+    model_override: str | None
+
+
+async def _create_subagent_child_session(
+    *,
+    server_client: httpx.AsyncClient,
+    conversation_id: str,
+    parent_agent_id: str,
+    agent_spec: Any | None,
+    sub_agent_name: str,
+    session_name: str,
+    harness_override: str | None,
+    require_harness_allowlist: bool,
+    model: str | None,
+    cost_budget: dict[str, Any] | None,
+) -> _CreatedSubagentChild | str:
+    """
+    Validate and create a fresh child session on the server.
+
+    The create half of ``sys_session_send``'s spawn path, extracted so the
+    cross-harness fallback engine can re-spawn a failed child with a
+    harness/model override through the exact same validation.
+
+    :param server_client: httpx client pointed at the Omnigent server.
+    :param conversation_id: Parent session id, e.g. ``"conv_parent123"``.
+    :param parent_agent_id: Parent agent id, e.g. ``"ag_abc123"``.
+    :param agent_spec: Parent agent's spec (or ``None``).
+    :param sub_agent_name: Sub-agent name, e.g. ``"reviewer"``.
+    :param session_name: Child instance title, e.g. ``"auth"``.
+    :param harness_override: Requested harness (alias or canonical), or
+        ``None`` to use the sub-agent spec's harness.
+    :param require_harness_allowlist: ``True`` for LLM-requested overrides
+        (the spec must opt in via ``executor.config.allowed_harnesses``);
+        ``False`` for spec-declared fallback targets, where a declared
+        allowlist still gates the harness but an absent one does not.
+    :param model: Validated requested model id, or ``None``.
+    :param cost_budget: Optional cost-budget policy params for the child.
+    :returns: The created child, or an ``"Error: ..."`` string.
+    """
+    child_harness = _subagent_harness(sub_agent_name, agent_spec)
+    # Apply an allowlisted per-dispatch harness override. The sub-agent
+    # spec must explicitly opt in via executor.config.allowed_harnesses,
+    # and the requested harness must canonicalize into OMNIGENT_HARNESSES.
+    # NOTE: the server create route (``_validated_harness_override`` in
+    # server/routes/sessions.py) independently re-validates a session-create
+    # override against the GLOBAL ``OMNIGENT_HARNESSES`` (plus the omnigent
+    # executor-type rule), but it does NOT re-check the per-spec
+    # ``allowed_harnesses`` allowlist. So this orchestrator-dispatch check is
+    # the sole enforcement of that per-spec allowlist; a direct
+    # ``POST /v1/sessions`` harness_override is bounded only by the global
+    # allowlist.
+    harness_override_canonical: str | None = None
+    if harness_override is not None:
+        from omnigent.spec._omnigent_compat import OMNIGENT_HARNESSES
+
+        canonical = canonicalize_harness(harness_override) or harness_override
+        allowed = _subagent_allowed_harnesses(sub_agent_name, agent_spec)
+        if require_harness_allowlist and not allowed:
+            return (
+                f"Error: sys_session_send 'harness' override is not "
+                f"permitted for sub-agent {sub_agent_name!r}: its spec "
+                "declares no executor.config.allowed_harnesses allowlist."
+            )
+        if allowed and canonical not in allowed:
+            return (
+                f"Error: sys_session_send 'harness' {harness_override!r} is "
+                f"not allowlisted for sub-agent {sub_agent_name!r}: allowed "
+                f"harnesses are {sorted(allowed)}."
+            )
+        if canonical not in OMNIGENT_HARNESSES:
+            return (
+                f"Error: sys_session_send 'harness' {harness_override!r} is "
+                f"not a known harness; must be one of {sorted(OMNIGENT_HARNESSES)}."
+            )
+        harness_override_canonical = canonical
+        child_harness = canonical
+    # Fail loud at dispatch when the child's harness needs a CLI binary
+    # that isn't on PATH. Otherwise a missing CLI surfaces only as a lazy
+    # first-turn failure (e.g. the pi harness raises ImportError, which the
+    # parent sees as a generic "turn failed" inbox item that hides the
+    # cause), and the orchestrator may re-dispatch into the same wall. The
+    # which-probe here reads the same PATH the harness boot uses, so the
+    # verdict can't disagree with the real launch.
+    from omnigent.onboarding.harness_install import missing_harness_cli
+
+    if child_harness is not None:
+        missing_cli = missing_harness_cli(child_harness)
+        if missing_cli is not None:
+            # Non-npm CLIs (e.g. cursor-agent) carry an ``install_hint``
+            # instead of a ``package``; using the hint avoids an
+            # ``npm install -g None`` instruction.
+            install = (
+                f"npm install -g {missing_cli.package}"
+                if missing_cli.package
+                else (missing_cli.install_hint or "see the harness's install docs")
+            )
+            return (
+                f"Error: sub-agent {sub_agent_name!r} can't start on this "
+                f"machine: harness {child_harness!r} needs the "
+                f"{missing_cli.binary!r} CLI on PATH, which was not found. "
+                f"Install it with: {install} "
+                f"(or don't dispatch to {sub_agent_name!r} here)."
+            )
+    # Create child session on the server (no initial items —
+    # those go via a separate POST so the server forwards them
+    # to the runner and triggers a turn).
+    create_body: dict[str, Any] = {
+        "agent_id": parent_agent_id,
+        "parent_session_id": conversation_id,
+        "title": f"{sub_agent_name}:{session_name}",
+        "sub_agent_name": sub_agent_name,
+    }
+    if harness_override_canonical is not None:
+        create_body["harness_override"] = harness_override_canonical
+    if model is not None:
+        # Reject up front when the child harness would silently
+        # ignore the persisted override — no silent drops.
+        if not harness_supports_model_override(child_harness):
+            return (
+                f"Error: sys_session_send 'model' is not supported for "
+                f"sub-agent {sub_agent_name!r}: harness "
+                f"{child_harness or 'unknown'!r} has no model-override "
+                "plumbing. Omit 'model' to use the harness default."
+            )
+        mismatch = model_family_mismatch(child_harness, model) if child_harness else None
+        if mismatch is not None:
+            return (
+                f"Error: sys_session_send 'model' rejected for sub-agent "
+                f"{sub_agent_name!r}: {mismatch}"
+            )
+        # Family guard first (on the requested id, so the error
+        # quotes what the caller sent), then mechanical
+        # canonical<->gateway-local normalization. The normalized
+        # id is what the server persists as model_override.
+        create_body["model_override"] = _normalize_subagent_model(
+            model,
+            sub_agent_name=sub_agent_name,
+            agent_spec=agent_spec,
+            harness=child_harness,
+        )
+    resp = await server_client.post("/v1/sessions", json=create_body, timeout=30.0)
+    if resp.status_code >= 400:
+        return f"Error: failed to create child session: {resp.status_code} {resp.text[:200]}"
+    child_data = resp.json()
+    child_session_id = child_data.get("session_id") or child_data.get("id")
+    if not child_session_id:
+        return "Error: server did not return child session_id"
+
+    # Attach a subagent_cost_budget policy to the child when requested.
+    # Non-fatal: the child session is still usable without the budget.
+    if cost_budget is not None:
+        policy_body = {
+            "name": "__subagent_cost_budget",
+            "type": "python",
+            "handler": "omnigent.policies.builtins.cost.subagent_cost_budget",
+            "factory_params": cost_budget,  # Dict with max_cost_usd and/or ask_thresholds_usd
+            "enabled": True,
+        }
+        try:
+            pol_resp = await server_client.post(
+                f"/v1/sessions/{child_session_id}/policies",
+                json=policy_body,
+                timeout=10.0,
+            )
+            if pol_resp.status_code >= 400:
                 _logger.warning(
-                    "failed to set subagent_cost_budget policy on child %s",
+                    "failed to set subagent_cost_budget policy on child %s: %s %s",
                     child_session_id,
-                    exc_info=True,
+                    pol_resp.status_code,
+                    pol_resp.text[:200],
                 )
+        except httpx.HTTPError:
+            _logger.warning(
+                "failed to set subagent_cost_budget policy on child %s",
+                child_session_id,
+                exc_info=True,
+            )
+
+    return _CreatedSubagentChild(
+        child_session_id=str(child_session_id),
+        wrapper_label=_session_wrapper_label(child_data),
+        harness=child_harness,
+        model_override=create_body.get("model_override"),
+    )
+
+
+async def _register_and_send_subagent_child(
+    *,
+    server_client: httpx.AsyncClient,
+    conversation_id: str,
+    parent_agent_id: str,
+    child_session_id: str,
+    sub_agent_name: str,
+    session_name: str,
+    message: str,
+    child_wrapper_label: str | None,
+    created_child: bool,
+    publish_event: Callable[[str, dict[str, Any]], None] | None,
+    active_harness: str | None = None,
+    active_model: str | None = None,
+    fallback_targets: tuple[FallbackTarget, ...] = (),
+    fallback_index: int = 0,
+    fallback_history: list[str] | None = None,
+    fallback_note: str | None = None,
+    work_id: str | None = None,
+) -> str | None:
+    """
+    Register runner bookkeeping for a child dispatch and post its message.
+
+    The send half of ``sys_session_send``'s spawn path (also used for a
+    repeated send to an existing child): publishes discovery events,
+    registers the child→parent fan-out mapping and the async work entry,
+    and POSTs the user message that starts the child turn. Reused by the
+    cross-harness fallback engine, which carries the original ``work_id``
+    and fallback bookkeeping onto the replacement child's work entry.
+
+    :param server_client: httpx client pointed at the Omnigent server.
+    :param conversation_id: Parent session id, e.g. ``"conv_parent123"``.
+    :param parent_agent_id: Parent agent id, e.g. ``"ag_abc123"``.
+    :param child_session_id: Child session id, e.g. ``"conv_child456"``.
+    :param sub_agent_name: Sub-agent name, e.g. ``"reviewer"``.
+    :param session_name: Child instance title, e.g. ``"auth"``.
+    :param message: The user message text to post to the child.
+    :param child_wrapper_label: The child's ``omnigent.wrapper`` label.
+    :param created_child: Whether the child session was just created (emits
+        ``session.created`` on the parent stream).
+    :param publish_event: Parent-stream event publisher, or ``None``.
+    :param active_harness: The child's effective harness, for fallback
+        provenance, e.g. ``"codex-native"``.
+    :param active_model: The child's persisted model override, if any.
+    :param fallback_targets: Cross-harness fallback targets captured from
+        the sub-agent spec at dispatch time.
+    :param fallback_index: Index of the next un-tried fallback target.
+    :param fallback_history: Prior fallback attempts, or ``None``.
+    :param fallback_note: Provenance note to prepend on a successful
+        fallback child's delivered output, or ``None``.
+    :param work_id: Dispatch id to carry over (fallback re-dispatch keeps
+        the original id so the parent correlates the eventual result).
+    :returns: ``None`` on success, or an ``"Error: ..."`` string.
+    """
+    # Lazy import to avoid circular dependency at module load.
+    from omnigent.runner import app as _runner_app
 
     # Publish session.created on the parent's SSE stream so the
     # REPL debug panel and any client subscribers discover the
@@ -1518,15 +1776,23 @@ async def _execute_subagent_tool(
     _runner_app.register_subagent_work(
         parent_session_id=conversation_id,
         child_session_id=child_session_id,
-        agent=str(sub_agent_name),
+        agent=sub_agent_name,
         title=session_name,
         wrapper_label=child_wrapper_label,
+        message=message,
+        active_harness=active_harness,
+        active_model=active_model,
+        fallback_targets=fallback_targets,
+        fallback_index=fallback_index,
+        fallback_history=fallback_history,
+        fallback_note=fallback_note,
+        work_id=work_id,
     )
     _publish_child_launching_update(
         parent_session_id=conversation_id,
         child_session_id=child_session_id,
         title=f"{sub_agent_name}:{session_name}",
-        tool=str(sub_agent_name),
+        tool=sub_agent_name,
         session_name=session_name,
         publish_event=publish_event,
     )
@@ -1541,7 +1807,7 @@ async def _execute_subagent_tool(
                 "type": "message",
                 "data": {
                     "role": "user",
-                    "content": [{"type": "input_text", "text": str(message)}],
+                    "content": [{"type": "input_text", "text": message}],
                 },
             },
             # This message is gated at the recipient's REQUEST phase, which can
@@ -1561,25 +1827,136 @@ async def _execute_subagent_tool(
         return (
             f"Error: failed to send message to child: {msg_resp.status_code} {msg_resp.text[:200]}"
         )
+    return None
 
-    # Return the structured handle mirrored from ``spawn.py``. The debug panel
-    # parses this to discover child sessions in the sidebar.
-    return json.dumps(
-        {
-            "task_id": child_session_id,
-            "handle_id": child_session_id,
-            "conversation_id": child_session_id,
-            "kind": "sub_agent",
-            "agent": sub_agent_name,
-            "title": session_name,
-            "status": "launching",
-            "message": (
-                f"[System: sub-agent {sub_agent_name} title {session_name!r} "
-                f"launching as task {child_session_id}. Result will appear in "
-                "your inbox; call sys_read_inbox to check or sys_cancel_task "
-                "to interrupt it.]"
-            ),
-        }
+
+async def dispatch_subagent_fallback_target(
+    *,
+    server_client: httpx.AsyncClient,
+    parent_session_id: str,
+    agent_spec: Any | None,
+    sub_agent_name: str,
+    session_name: str,
+    message: str,
+    target: FallbackTarget,
+    superseded_child_session_id: str,
+    work_id: str,
+    fallback_targets: tuple[FallbackTarget, ...],
+    fallback_index: int,
+    fallback_history: list[str],
+    fallback_note: str,
+    publish_event: Callable[[str, dict[str, Any]], None] | None = None,
+) -> str | None:
+    """
+    Re-dispatch failed sub-agent work on one cross-harness fallback target.
+
+    Spawns a FRESH child session (model/harness are create-time-only for
+    native children) with the target's harness/model overrides, replays the
+    original user message, and registers a work entry that keeps the
+    original ``work_id`` so the eventual completion lands in the parent
+    inbox as the same piece of work. The failed child's ``(parent, title)``
+    slot is freed first by tombstoning its title the same way
+    ``sys_session_close`` does.
+
+    :param server_client: httpx client pointed at the Omnigent server.
+    :param parent_session_id: Parent session id, e.g. ``"conv_parent123"``.
+    :param agent_spec: Parent agent's spec (or ``None``).
+    :param sub_agent_name: Sub-agent name, e.g. ``"reviewer"``.
+    :param session_name: Child instance title, e.g. ``"auth"``.
+    :param message: The original user message to replay.
+    :param target: The fallback target to dispatch on.
+    :param superseded_child_session_id: The failed child being replaced,
+        e.g. ``"conv_child456"``.
+    :param work_id: The original dispatch id to carry over.
+    :param fallback_targets: The full ordered target tuple (carried onto
+        the new entry so its own failure can consume the next target).
+    :param fallback_index: Index of the next target AFTER this one.
+    :param fallback_history: History lines to carry onto the new entry.
+    :param fallback_note: Provenance note for the new entry's successful
+        delivery.
+    :param publish_event: Parent-stream event publisher, or ``None``.
+    :returns: ``None`` on success, or an error string describing why this
+        target could not be dispatched (the caller tries the next target).
+    """
+    # Lazy import to avoid circular dependency at module load.
+    from omnigent.runner import app as _runner_app
+
+    model: str | None = None
+    if target.model is not None:
+        try:
+            model = validate_model_override(target.model)
+        except ValueError as exc:
+            return f"Error: invalid fallback model {target.model!r}: {exc}"
+
+    parent_agent_id = _runner_app.get_session_agent_id(parent_session_id)
+    if parent_agent_id is None:
+        try:
+            sess_resp = await server_client.get(
+                f"/v1/sessions/{parent_session_id}",
+                timeout=10.0,
+            )
+            if sess_resp.status_code == 200:
+                parent_agent_id = sess_resp.json().get("agent_id")
+        except (httpx.HTTPError, RuntimeError):
+            pass
+    if parent_agent_id is None:
+        return "Error: cannot resolve parent agent_id for fallback dispatch"
+
+    # Free the (parent_conversation_id, title) unique slot held by the
+    # failed child, mirroring sys_session_close's title tombstone.
+    # Best-effort: if the PATCH fails, the create below fails loud on the
+    # unique index and this target is reported as undispatchable.
+    try:
+        await server_client.patch(
+            f"/v1/sessions/{superseded_child_session_id}",
+            json={
+                "title": (
+                    f"{sub_agent_name}:{session_name}"
+                    f"{_CLOSED_TITLE_INFIX}{superseded_child_session_id}"
+                ),
+                "labels": {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE},
+            },
+            timeout=10.0,
+        )
+    except httpx.HTTPError:
+        _logger.warning(
+            "fallback: failed to tombstone superseded child %s",
+            superseded_child_session_id,
+            exc_info=True,
+        )
+
+    created = await _create_subagent_child_session(
+        server_client=server_client,
+        conversation_id=parent_session_id,
+        parent_agent_id=str(parent_agent_id),
+        agent_spec=agent_spec,
+        sub_agent_name=sub_agent_name,
+        session_name=session_name,
+        harness_override=target.harness,
+        require_harness_allowlist=False,
+        model=model,
+        cost_budget=None,
+    )
+    if isinstance(created, str):
+        return created
+    return await _register_and_send_subagent_child(
+        server_client=server_client,
+        conversation_id=parent_session_id,
+        parent_agent_id=str(parent_agent_id),
+        child_session_id=created.child_session_id,
+        sub_agent_name=sub_agent_name,
+        session_name=session_name,
+        message=message,
+        child_wrapper_label=created.wrapper_label,
+        created_child=True,
+        publish_event=publish_event,
+        active_harness=created.harness,
+        active_model=created.model_override,
+        fallback_targets=fallback_targets,
+        fallback_index=fallback_index,
+        fallback_history=fallback_history,
+        fallback_note=fallback_note,
+        work_id=work_id,
     )
 
 
