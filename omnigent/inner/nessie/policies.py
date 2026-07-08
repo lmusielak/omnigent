@@ -10,10 +10,14 @@ The evaluators run runner-side at tool dispatch
 
 from __future__ import annotations
 
+import logging
+import os
 import re
 import shlex
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any, TypeAlias
+
+_logger = logging.getLogger(__name__)
 
 # Heterogeneous JSON-shaped maps — the V0 policy event + decision payloads.
 _Json: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
@@ -343,10 +347,152 @@ def _push_severity(argv: list[str]) -> str | None:
     return "ASK"
 
 
+# Git subcommands that rewrite the checked-out tree / move its HEAD; against a
+# protected tree these are the churn ``blast_radius(protected_trees=…)`` denies.
+_PROTECTED_TREE_CHURN_SUBCOMMANDS: frozenset[str] = frozenset(
+    {"checkout", "switch", "rebase", "reset"}
+)
+
+
+def _git_global_paths(argv: list[str], start: int) -> tuple[int, list[str]]:
+    """
+    Parse git global options; return the subcommand index and explicit targets.
+
+    Collects the tree-selecting global options — ``-C`` (chained per git
+    semantics: successive values join, an absolute value restarts the
+    chain) plus ``--git-dir`` / ``--work-tree`` in both the separate and
+    ``=``-attached forms — and skips over the other value-taking globals
+    (:data:`_GIT_GLOBAL_VALUE_OPTS`) so the subcommand is found reliably.
+
+    :param argv: One statement's tokens, e.g.
+        ``["git", "-C", "/repo", "rebase", "main"]``.
+    :param start: Index of the first token after ``git``.
+    :returns: ``(subcommand_index, target_paths)`` — the paths a target
+        tree was explicitly selected with (possibly relative; empty when
+        the command relies on its cwd).
+    """
+    paths: list[str] = []
+    chdir: str | None = None
+    j = start
+    while j < len(argv) and argv[j].startswith("-"):
+        tok = argv[j]
+        if tok == "-C" and j + 1 < len(argv):
+            chdir = argv[j + 1] if chdir is None else os.path.join(chdir, argv[j + 1])
+            j += 2
+        elif tok in ("--git-dir", "--work-tree") and j + 1 < len(argv):
+            paths.append(argv[j + 1])
+            j += 2
+        elif tok.startswith(("--git-dir=", "--work-tree=")):
+            paths.append(tok.split("=", 1)[1])
+            j += 1
+        elif tok in _GIT_GLOBAL_VALUE_OPTS and j + 1 < len(argv):
+            j += 2
+        else:
+            j += 1
+    if chdir is not None:
+        paths.append(chdir)
+    return j, paths
+
+
+def _path_is_within_tree(path: str, tree: str) -> bool:
+    """
+    Whether *path* is *tree* itself or inside it (symlink- and prefix-safe).
+
+    Both sides are realpath-resolved; containment uses
+    :func:`os.path.commonpath`, so a sibling sharing a name prefix
+    (``/repo-evil`` vs ``/repo``) is NOT treated as inside. Relative paths
+    are never a match — without the event's cwd they cannot be resolved.
+
+    :param path: Candidate target path from the command line.
+    :param tree: A protected tree root (absolute).
+    :returns: ``True`` when *path* resolves to *tree* or below it.
+    """
+    if not os.path.isabs(path):
+        return False
+    resolved = os.path.realpath(path)
+    root = os.path.realpath(tree)
+    try:
+        return os.path.commonpath([resolved, root]) == root
+    except ValueError:
+        return False
+
+
+def _branch_is_destructive(rest: list[str]) -> bool:
+    """
+    Whether a ``git branch`` argument list force-moves or force-deletes.
+
+    Matches ``--force``, ``-D``, and any bundled short-option token
+    carrying ``f`` or ``D`` (``-fD``, ``-Df``). A plain ``-d`` (safe,
+    merged-only delete) is not destructive.
+
+    :param rest: Tokens after the ``branch`` subcommand.
+    :returns: ``True`` for a forced branch mutation.
+    """
+    for tok in rest:
+        if tok == "--force":
+            return True
+        if tok.startswith("-") and not tok.startswith("--") and any(c in "fD" for c in tok[1:]):
+            return True
+    return False
+
+
+def _protected_tree_denial(argv: list[str], protected_trees: tuple[str, ...]) -> str | None:
+    """
+    Return a denial reason when *argv* is git churn against a protected tree.
+
+    Churn = ``checkout`` / ``switch`` / ``rebase`` / ``reset`` /
+    ``worktree remove`` / forced ``branch``, plus ``merge`` / ``pull``
+    WITHOUT ``--ff-only`` (the ff-only forms are the one sanctioned way a
+    protected tree moves). The target tree comes from the explicit global
+    options (``-C`` / ``--git-dir`` / ``--work-tree``) — and, for
+    ``worktree remove``, its path operands. A churn command whose target
+    cannot be resolved (bare command relying on cwd, which the policy
+    event does not carry) is allowed with a visible log line rather than
+    silently.
+
+    :param argv: One statement's tokens.
+    :param protected_trees: Absolute protected tree roots.
+    :returns: A human-readable reason to DENY, or ``None`` to leave the
+        statement to the ordinary blast-radius tiers.
+    """
+    i = _command_index_after_shell_prefixes(argv)
+    if i >= len(argv) or argv[i] != "git":
+        return None
+    j, target_paths = _git_global_paths(argv, i + 1)
+    if j >= len(argv):
+        return None
+    sub = argv[j]
+    rest = argv[j + 1 :]
+    churn: str | None = None
+    if sub in _PROTECTED_TREE_CHURN_SUBCOMMANDS:
+        churn = f"git {sub}"
+    elif sub == "worktree":
+        positional = [tok for tok in rest if not tok.startswith("-")]
+        if positional and positional[0] == "remove":
+            churn = "git worktree remove"
+            # The operand IS the tree being removed — check it too.
+            target_paths.extend(positional[1:])
+    elif sub == "branch" and _branch_is_destructive(rest):
+        churn = "git branch --force/-D"
+    elif sub in ("merge", "pull") and "--ff-only" not in rest:
+        churn = f"git {sub} without --ff-only"
+    if churn is None:
+        return None
+    if not target_paths:
+        _logger.info("protected-tree policy: target unresolvable, allowing (%s)", shlex.join(argv))
+        return None
+    for path in target_paths:
+        for tree in protected_trees:
+            if _path_is_within_tree(path, tree):
+                return f"{churn} targets protected tree {tree}"
+    return None
+
+
 def blast_radius(
     *,
     gate_pushes: bool = True,
     deny_reason: str = "Blocked by the blast-radius policy.",
+    protected_trees: Sequence[str] = (),
 ) -> Callable[[_Json, _Json], _Json]:
     """
     Factory: gate high-blast-radius shell commands by reversibility.
@@ -362,8 +508,19 @@ def blast_radius(
         commands return ASK. When ``False`` only the catastrophic DENY
         set is enforced — use only for trusted unattended batch runs.
     :param deny_reason: Reason text surfaced on a DENY decision.
+    :param protected_trees: Absolute paths of git work trees whose
+        history/checkout must not be churned by agents (e.g. the live
+        registry checkout). When set, DENY ``git checkout / switch /
+        rebase / reset / worktree remove / branch -f|-D`` — and ``merge``
+        / ``pull`` without ``--ff-only`` — whose target resolves to a
+        protected tree or below it. ``git merge --ff-only`` / ``git pull
+        --ff-only`` stay allowed (the sanctioned fast-forward). Empty
+        (default) preserves the exact prior behavior. This gates agent
+        shell tool calls only; it is defense-in-depth, not a lock — the
+        registry's git-object-store snapshotting is the backstop.
     :returns: An evaluator ``fn(event, config)`` returning a V0 decision.
     """
+    protected = tuple(protected_trees)
 
     def _evaluate(event: _Json, config: _Json) -> _Json:  # noqa: ARG001
         """
@@ -393,6 +550,11 @@ def blast_radius(
         # missed split/long rm flags, root children, and force/delete refspecs);
         # the remaining regex patterns cover git-reset / gh / infra tools.
         statements = _shell_statements(command)
+        if protected:
+            for stmt in statements:
+                protected_reason = _protected_tree_denial(stmt, protected)
+                if protected_reason is not None:
+                    return _decision("DENY", f"{deny_reason} ({protected_reason}: {command!r})")
         severities = {
             sev for stmt in statements for sev in (_rm_severity(stmt), _push_severity(stmt))
         }
@@ -634,7 +796,9 @@ POLICY_REGISTRY: list[dict[str, Any]] = [
         "name": "Block Dangerous Shell Commands force-push, rm -rf",
         "description": "Classifies shell commands (sys_os_shell, Claude/Codex native Bash, "
         "and Pi native bash) as safe, risky (ASK), or catastrophic (DENY) to prevent "
-        "destructive operations like force-push or rm -rf /",
+        "destructive operations like force-push or rm -rf /. Optionally denies git "
+        "checkout/switch/rebase/reset/worktree-remove/branch -f and non-ff merge/pull "
+        "against configured protected_trees",
     },
     {
         "handler": "omnigent.inner.nessie.policies.spawn_bounds",
