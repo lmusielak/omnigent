@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import io
+import logging
+import os
+import subprocess
 import tarfile
 import textwrap
 from pathlib import Path
@@ -11,7 +14,7 @@ import pytest
 import yaml
 
 from omnigent.errors import OmnigentError
-from omnigent.spec import load, materialize_bundle
+from omnigent.spec import git_head_sha, git_mid_operation_state, load, materialize_bundle
 from omnigent.spec._omnigent_compat import load_omnigent_yaml
 
 
@@ -643,3 +646,195 @@ def test_load_pruning_drops_grandchild_but_keeps_valid_child(tmp_path: Path) -> 
     child = spec.sub_agents[0]
     assert child.sub_agents == []
     assert child.tools.agents == []
+
+
+# ── materialize_bundle — git object-store snapshots ─────────
+
+# Deterministic identity + config so the tests don't depend on the
+# developer's global git config (user.name / init.defaultBranch).
+_GIT_ENV = {
+    "GIT_AUTHOR_NAME": "t",
+    "GIT_AUTHOR_EMAIL": "t@t",
+    "GIT_COMMITTER_NAME": "t",
+    "GIT_COMMITTER_EMAIL": "t@t",
+}
+
+
+def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    """Run a git command in *repo* with a pinned identity.
+
+    :param repo: Repository directory to run in.
+    :param args: Git arguments after ``git``, e.g. ``("add", ".")``.
+    :param check: Raise on non-zero exit (disable for commands expected
+        to conflict, e.g. a rebase that must stop mid-way).
+    :returns: The completed process (stdout captured, text mode).
+    """
+    return subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        env={**os.environ, **_GIT_ENV},
+        check=check,
+        capture_output=True,
+        text=True,
+    )
+
+
+@pytest.fixture()
+def git_agent_repo(tmp_path: Path) -> Path:
+    """A git repo whose committed tree is a minimal valid agent image."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    (repo / "config.yaml").write_text("spec_version: 1\nname: git-agent\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "c1")
+    return repo
+
+
+def test_materialize_bundle_git_source_ships_committed_state_only(
+    git_agent_repo: Path,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A git-backed directory source snapshots the committed HEAD tree, not
+    the working tree: dirty edits and untracked files (e.g. a local
+    ``.env`` with credentials) must NOT ship, and a WARNING must list the
+    excluded paths so the operator sees exactly what didn't ship.
+
+    What breaks if this fails: a registration racing a rebase copies a
+    half-transformed registry, and untracked credential files leak into
+    every artifact-store tarball.
+    """
+    committed = (git_agent_repo / "config.yaml").read_text()
+    (git_agent_repo / "config.yaml").write_text(committed + "prompt: dirty-edit\n")
+    (git_agent_repo / "secrets.env").write_text("TOKEN=hunter2\n")
+
+    dest = tmp_path / "bundle"
+    with caplog.at_level(logging.WARNING, logger="omnigent.spec"):
+        materialize_bundle(git_agent_repo, dest)
+
+    # Snapshot content == committed HEAD content; nothing uncommitted.
+    assert (dest / "config.yaml").read_text() == committed
+    assert not (dest / "secrets.env").exists()
+    # The WARNING names each excluded path.
+    warning = "\n".join(r.message for r in caplog.records if r.levelno == logging.WARNING)
+    assert "config.yaml" in warning
+    assert "secrets.env" in warning
+
+
+def test_materialize_bundle_git_subdirectory_source(tmp_path: Path) -> None:
+    """
+    When the source is a subdirectory of the repo root (e.g.
+    ``repo/examples/agent``), only that subtree is snapshotted and lands
+    at the root of *dest* — the same shape a copytree would produce, so
+    ``spec.load(bundle_dir)`` finds ``config.yaml`` at the top.
+    """
+    repo = tmp_path / "repo"
+    (repo / "agents" / "sub").mkdir(parents=True)
+    _git(repo, "init", "-q", "-b", "main")
+    (repo / "top.txt").write_text("repo-root file, must not ship\n")
+    (repo / "agents" / "sub" / "config.yaml").write_text("spec_version: 1\nname: sub\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "c1")
+
+    dest = tmp_path / "bundle"
+    materialize_bundle(repo / "agents" / "sub", dest)
+
+    assert (dest / "config.yaml").read_text() == "spec_version: 1\nname: sub\n"
+    assert not (dest / "top.txt").exists()
+    assert not (dest / "agents").exists()
+
+
+def test_materialize_bundle_pinned_sha_snapshots_that_commit(
+    git_agent_repo: Path, tmp_path: Path
+) -> None:
+    """
+    ``pinned_git_sha`` archives exactly the pinned commit even after HEAD
+    moves on — the mechanism ``_preregister_agent`` uses to make its
+    check-then-snapshot sequence race-free.
+    """
+    pinned = _git(git_agent_repo, "rev-parse", "HEAD").stdout.strip()
+    (git_agent_repo / "config.yaml").write_text("spec_version: 1\nname: moved-on\n")
+    _git(git_agent_repo, "commit", "-qam", "c2")
+
+    dest = tmp_path / "bundle"
+    materialize_bundle(git_agent_repo, dest, pinned_git_sha=pinned)
+
+    assert (dest / "config.yaml").read_text() == "spec_version: 1\nname: git-agent\n"
+
+
+def test_git_head_sha_none_for_non_git_directory(tmp_path: Path) -> None:
+    """
+    A plain directory (no enclosing git work tree) resolves to ``None`` —
+    the signal for callers to take the copytree path with no git gating.
+    """
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    assert git_head_sha(plain) is None
+
+
+def test_git_mid_operation_state_detects_rebase_merge_and_detached(
+    git_agent_repo: Path,
+) -> None:
+    """
+    The mid-operation probe reports a stable repo as ``None`` and names
+    the in-flight operation for a real conflicted rebase, a real
+    conflicted merge, and a detached HEAD — the states in which a
+    registration snapshot must be refused.
+    """
+    assert git_mid_operation_state(git_agent_repo) is None
+
+    # Conflicting branches: both rewrite config.yaml's name line.
+    _git(git_agent_repo, "checkout", "-qb", "side")
+    (git_agent_repo / "config.yaml").write_text("spec_version: 1\nname: side\n")
+    _git(git_agent_repo, "commit", "-qam", "side")
+    _git(git_agent_repo, "checkout", "-q", "main")
+    (git_agent_repo / "config.yaml").write_text("spec_version: 1\nname: main\n")
+    _git(git_agent_repo, "commit", "-qam", "main")
+
+    # Real conflicted merge → MERGE_HEAD present.
+    assert _git(git_agent_repo, "merge", "side", check=False).returncode != 0
+    state = git_mid_operation_state(git_agent_repo)
+    assert state is not None and "merge" in state
+    _git(git_agent_repo, "merge", "--abort")
+
+    # Real conflicted rebase → rebase state dir present.
+    _git(git_agent_repo, "checkout", "-q", "side")
+    assert _git(git_agent_repo, "rebase", "main", check=False).returncode != 0
+    state = git_mid_operation_state(git_agent_repo)
+    assert state is not None and "rebase" in state
+    _git(git_agent_repo, "rebase", "--abort")
+
+    # Detached HEAD (no operation in flight, but not a branch tip).
+    _git(git_agent_repo, "checkout", "-q", "--detach")
+    assert git_mid_operation_state(git_agent_repo) == "detached HEAD"
+
+
+def test_git_mid_operation_state_sees_linked_worktree_state(
+    git_agent_repo: Path, tmp_path: Path
+) -> None:
+    """
+    In a linked worktree the rebase/merge state files live under the
+    worktree's private gitdir (``.git/worktrees/<name>/…``), not the
+    shared ``.git/``. The probe must resolve them via ``git rev-parse
+    --git-path`` — hardcoding ``.git/rebase-merge`` would miss an
+    in-flight rebase inside a worktree and let a torn snapshot through.
+    """
+    _git(git_agent_repo, "checkout", "-qb", "side")
+    (git_agent_repo / "config.yaml").write_text("spec_version: 1\nname: side\n")
+    _git(git_agent_repo, "commit", "-qam", "side")
+    _git(git_agent_repo, "checkout", "-q", "main")
+    (git_agent_repo / "config.yaml").write_text("spec_version: 1\nname: main\n")
+    _git(git_agent_repo, "commit", "-qam", "main")
+
+    wt = tmp_path / "wt"
+    _git(git_agent_repo, "worktree", "add", "-q", str(wt), "side")
+    assert git_mid_operation_state(wt) is None
+
+    assert _git(wt, "rebase", "main", check=False).returncode != 0
+    state = git_mid_operation_state(wt)
+    assert state is not None and "rebase" in state
+    # The main checkout is untouched by the worktree's rebase... but its
+    # HEAD is a branch tip mid-nothing — still stable.
+    assert git_mid_operation_state(git_agent_repo) is None
