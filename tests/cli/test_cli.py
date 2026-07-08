@@ -2315,6 +2315,204 @@ def test_preregister_agent_stored_tarball_rehydrates(tmp_path: Path) -> None:
     assert spec.name == "supervisor-probe"
 
 
+# ── _preregister_agent — git-backed sources ─────────────────
+
+# Deterministic identity + config so the tests don't depend on the
+# developer's global git config (user.name / init.defaultBranch).
+_GIT_ENV = {
+    "GIT_AUTHOR_NAME": "t",
+    "GIT_AUTHOR_EMAIL": "t@t",
+    "GIT_COMMITTER_NAME": "t",
+    "GIT_COMMITTER_EMAIL": "t@t",
+}
+
+
+def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    """Run a git command in *repo* with a pinned identity.
+
+    :param repo: Repository directory to run in.
+    :param args: Git arguments after ``git``, e.g. ``("add", ".")``.
+    :param check: Raise on non-zero exit (disable for commands expected
+        to conflict, e.g. a rebase that must stop mid-way).
+    :returns: The completed process (stdout captured, text mode).
+    """
+    return subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        env={**os.environ, **_GIT_ENV},
+        check=check,
+        capture_output=True,
+        text=True,
+    )
+
+
+class _ExistingAgentStore(_RecordingAgentStore):
+    """Agent store stub with one pre-existing registration."""
+
+    def __init__(self, name: str, agent_id: str, bundle_location: str) -> None:
+        super().__init__()
+        self._existing = SimpleNamespace(id=agent_id, name=name, bundle_location=bundle_location)
+        self.updated: list[tuple[str, str]] = []
+
+    def get_by_name(self, name: str) -> SimpleNamespace | None:
+        """:returns: The pre-existing row when *name* matches, else ``None``."""
+        return self._existing if name == self._existing.name else None
+
+    def update(self, agent_id: str, *, bundle_location: str) -> None:
+        """Record the update-call for assertions."""
+        self.updated.append((agent_id, bundle_location))
+
+
+def _mid_rebase_agent_repo(tmp_path: Path, name: str) -> Path:
+    """Create an agent-image git repo stopped in a real conflicted rebase.
+
+    :param tmp_path: Test-scoped scratch directory.
+    :param name: The committed spec ``name`` on the ``main`` branch.
+    :returns: The repo path, with ``rebase-merge`` state present.
+    """
+    repo = tmp_path / "agent-repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _write_config(
+        repo,
+        {
+            "spec_version": 1,
+            "name": name,
+            "executor": {"config": {"harness": "openai-agents"}},
+        },
+    )
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "c1")
+    # Conflicting branches: both rewrite config.yaml.
+    _git(repo, "checkout", "-qb", "side")
+    _write_config(repo, {"spec_version": 1, "name": f"{name}-side"})
+    _git(repo, "commit", "-qam", "side")
+    _git(repo, "checkout", "-q", "main")
+    _write_config(repo, {"spec_version": 1, "name": f"{name}-main"})
+    _git(repo, "commit", "-qam", "main")
+    _git(repo, "checkout", "-q", "side")
+    assert _git(repo, "rebase", "main", check=False).returncode != 0
+    return repo
+
+
+def test_preregister_agent_mid_rebase_first_registration_fails_loud(tmp_path: Path) -> None:
+    """
+    A first ``--agent`` registration from a repo stopped mid-rebase must
+    refuse with a clear error — better no host than a torn registry.
+    Nothing may be written to any store.
+    """
+    repo = _mid_rebase_agent_repo(tmp_path, "torn-agent")
+    agent_store = _RecordingAgentStore()
+    artifact_store = _RecordingArtifactStore()
+    agent_cache = _RecordingAgentCache()
+
+    with pytest.raises(ClickException, match="unstable git source"):
+        _preregister_agent(repo, agent_store, artifact_store, agent_cache)
+
+    assert agent_store.created == []
+    assert artifact_store.puts == []
+
+
+def test_preregister_agent_mid_rebase_reregistration_keeps_snapshot(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    Re-registering an existing agent from a mid-rebase repo must keep the
+    known-good snapshot: no artifact put, no cache replace, the existing
+    id returned, and an ERROR naming the kept snapshot in the log — the
+    operator signal the silent hot-swap lacked.
+    """
+    repo = _mid_rebase_agent_repo(tmp_path, "live-agent")
+    # Mid-rebase HEAD sits on main's commit, so the committed name probe
+    # sees the main-branch name.
+    agent_store = _ExistingAgentStore("live-agent-main", "agent-123", "agent-123/knowngood")
+    artifact_store = _RecordingArtifactStore()
+    agent_cache = _RecordingAgentCache()
+
+    with caplog.at_level(logging.ERROR, logger="omnigent.cli"):
+        agent_id = _preregister_agent(repo, agent_store, artifact_store, agent_cache)
+
+    assert agent_id == "agent-123"
+    assert artifact_store.puts == []
+    assert agent_cache.replaces == []
+    assert agent_store.created == []
+    errors = "\n".join(r.message for r in caplog.records if r.levelno == logging.ERROR)
+    assert "keeping snapshot" in errors
+    assert "agent-123/knowngood" in errors
+
+
+def test_preregister_agent_toctou_head_move_retries_then_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    When HEAD keeps moving between the pre-check and the post-check
+    (a rebase racing the snapshot), the sequence must retry exactly once
+    and then refuse — never register a snapshot whose sha it cannot pin.
+    """
+    import omnigent.spec as spec_mod
+
+    agent_dir = tmp_path / "racing-agent"
+    agent_dir.mkdir()
+    _write_config(
+        agent_dir,
+        {
+            "spec_version": 1,
+            "name": "racing-agent",
+            "executor": {"config": {"harness": "openai-agents"}},
+        },
+    )
+
+    shas = iter(f"{i:040x}" for i in range(10))
+    calls = {"head": 0}
+
+    def fake_head_sha(source: Path) -> str:
+        calls["head"] += 1
+        return next(shas)
+
+    monkeypatch.setattr(spec_mod, "git_head_sha", fake_head_sha)
+    monkeypatch.setattr(spec_mod, "git_mid_operation_state", lambda source: None)
+
+    with pytest.raises(ClickException, match="HEAD moved"):
+        _preregister_agent(
+            agent_dir, _RecordingAgentStore(), _RecordingArtifactStore(), _RecordingAgentCache()
+        )
+
+    # Two attempts, each resolving HEAD before and after the snapshot.
+    assert calls["head"] == 4
+
+
+def test_preregister_agent_toctou_stable_head_registers_with_sha(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """
+    The happy path for a clean git source: the snapshot lands, and the
+    registration line names the commit the running registry came from.
+    """
+    repo = tmp_path / "clean-agent"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _write_config(
+        repo,
+        {
+            "spec_version": 1,
+            "name": "clean-agent",
+            "executor": {"config": {"harness": "openai-agents"}},
+        },
+    )
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "c1")
+    sha = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    agent_store = _RecordingAgentStore()
+    agent_id = _preregister_agent(
+        repo, agent_store, _RecordingArtifactStore(), _RecordingAgentCache()
+    )
+
+    assert agent_id is not None
+    assert agent_store.created[0]["name"] == "clean-agent"
+    assert f"@ {sha[:8]}" in capsys.readouterr().out
+
+
 # ── no-AGENT harness launch ───────────────────────────
 
 
