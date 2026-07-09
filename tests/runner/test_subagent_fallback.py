@@ -31,6 +31,7 @@ from omnigent.runner.tool_dispatch import (
     FallbackTarget,
     _consult_ppu_oracle,
     _ppu_oracle_payload_eligible,
+    _sanitize_ppu_reason,
     _subagent_fallback_targets,
 )
 from omnigent.spec import parser as spec_parser
@@ -390,10 +391,62 @@ async def test_consult_ppu_oracle_eligible_uses_default_url(
 
 @pytest.mark.asyncio
 async def test_consult_ppu_oracle_honors_env_url(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("OMNIGENT_PPU_ORACLE_URL", "http://oracle.test:9999/quota")
+    monkeypatch.setenv("OMNIGENT_PPU_ORACLE_URL", "https://127.0.0.1:9/quota")
     requested = _patch_oracle_http(monkeypatch, payload=_eligible_ppu_payload())
     assert await _consult_ppu_oracle() == (True, "eligible")
-    assert requested == ["http://oracle.test:9999/quota"]
+    assert requested == ["https://127.0.0.1:9/quota"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://evil.example/quota",
+        "http://oracle.test:9999/quota",
+        "http://127.0.0.2:5151/quota",  # loopback range but not the exact allowed host
+        "not a url at all",
+        "http://[::1]:5151/quota",  # IPv6 loopback intentionally excluded
+    ],
+)
+async def test_consult_ppu_oracle_denies_non_loopback_url_without_request(
+    monkeypatch: pytest.MonkeyPatch,
+    url: str,
+) -> None:
+    """A spoofed/redirected oracle URL denies consent before any HTTP I/O."""
+    monkeypatch.setenv("OMNIGENT_PPU_ORACLE_URL", url)
+    requested = _patch_oracle_http(monkeypatch, payload=_eligible_ppu_payload())
+    eligible, reason = await _consult_ppu_oracle()
+    assert eligible is False
+    assert reason == "oracle URL not loopback — consent denied"
+    assert requested == [], "a non-loopback oracle URL must never be fetched"
+
+
+def test_sanitize_ppu_reason_strips_control_chars_and_caps() -> None:
+    raw = "denied\r\nreason\x1b[31m\x00" + "x" * 500
+    cleaned = _sanitize_ppu_reason(raw)
+    assert "\n" not in cleaned
+    assert "\r" not in cleaned
+    assert "\x1b" not in cleaned
+    assert "\x00" not in cleaned
+    assert cleaned.startswith("deniedreason[31mxxx")
+    assert len(cleaned) == 200
+
+
+@pytest.mark.asyncio
+async def test_consult_ppu_oracle_sanitizes_every_returned_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sanitizer wraps the read itself, so a hostile reason never escapes."""
+
+    async def _hostile_read() -> tuple[bool, str]:
+        return (False, "oracle said:\r\nEVIL\x1b[31m " + "y" * 500)
+
+    monkeypatch.setattr("omnigent.runner.tool_dispatch._read_ppu_oracle", _hostile_read)
+    eligible, reason = await _consult_ppu_oracle()
+    assert eligible is False
+    assert "\n" not in reason
+    assert "\x1b" not in reason
+    assert len(reason) == 200
 
 
 @pytest.mark.asyncio

@@ -30,6 +30,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlparse
 
 if TYPE_CHECKING:
     from omnigent.runtime.filesystem_registry import FilesystemRegistry
@@ -2016,6 +2017,25 @@ async def tombstone_superseded_subagent_child(
 _PPU_ORACLE_URL_ENV = "OMNIGENT_PPU_ORACLE_URL"
 _PPU_ORACLE_DEFAULT_URL = "http://localhost:5151/quota"
 _PPU_ORACLE_TIMEOUT_S = 2.0
+# The oracle is a local consent authority: a non-loopback URL (env spoof /
+# redirect) must never be able to grant pay-per-use spend.
+_PPU_ORACLE_ALLOWED_HOSTS = frozenset({"localhost", "127.0.0.1"})
+_PPU_REASON_MAX_LEN = 200
+
+
+def _sanitize_ppu_reason(reason: str) -> str:
+    """
+    Strip control characters from a PPU consent reason and cap its length.
+
+    Reasons flow into the runner log and the parent-visible fallback
+    history, so an oracle error body must not be able to smuggle
+    newlines/ANSI sequences or unbounded text into either.
+
+    :param reason: The raw reason text, e.g. ``"oracle returned HTTP 500"``.
+    :returns: The reason with non-printable characters removed, at most
+        200 characters.
+    """
+    return "".join(ch for ch in reason if ch.isprintable())[:_PPU_REASON_MAX_LEN]
 
 
 def _ppu_oracle_payload_eligible(payload: Any) -> tuple[bool, str]:
@@ -2054,15 +2074,34 @@ async def _consult_ppu_oracle() -> tuple[bool, str]:
     Live-read the PPU consent oracle for pay-per-use fallback eligibility.
 
     GETs ``$OMNIGENT_PPU_ORACLE_URL`` (default
-    ``http://localhost:5151/quota``) with a 2s timeout. Fail-closed: an
-    unreachable oracle, non-200 status, or undecodable body denies
-    consent rather than granting it.
+    ``http://localhost:5151/quota``) with a 2s timeout. Loopback-only: a
+    URL whose hostname is not ``localhost``/``127.0.0.1`` is denied
+    without any request, so a spoofed env var cannot point consent at an
+    attacker-controlled host. Fail-closed: an unreachable oracle, non-200
+    status, or undecodable body denies consent rather than granting it.
+    Every returned reason is sanitized for log/history embedding.
 
     :returns: ``(eligible, reason)`` per
         :func:`_ppu_oracle_payload_eligible`; transport/status failures
         carry their own reason.
     """
+    eligible, reason = await _read_ppu_oracle()
+    return eligible, _sanitize_ppu_reason(reason)
+
+
+async def _read_ppu_oracle() -> tuple[bool, str]:
+    """
+    The unsanitized half of :func:`_consult_ppu_oracle` — see there.
+
+    :returns: ``(eligible, reason)`` with the reason not yet sanitized.
+    """
     url = os.environ.get(_PPU_ORACLE_URL_ENV) or _PPU_ORACLE_DEFAULT_URL
+    try:
+        host = urlparse(url).hostname
+    except ValueError:
+        host = None
+    if host not in _PPU_ORACLE_ALLOWED_HOSTS:
+        return False, "oracle URL not loopback — consent denied"
     try:
         async with httpx.AsyncClient(timeout=_PPU_ORACLE_TIMEOUT_S) as client:
             resp = await client.get(url)
