@@ -1086,11 +1086,14 @@ class FallbackTarget:
         ``"google/gemini-2.5-pro"``. ``None`` uses the harness default.
     :param on: Error kinds this target covers, a subset of
         :data:`omnigent.turn_errors.TURN_ERROR_KINDS`.
+    :param consult_ppu: Whether dispatching on this target requires a
+        live grant from the PPU consent oracle (pay-per-use spend gate).
     """
 
     harness: str
     model: str | None = None
     on: frozenset[str] = frozenset({"quota"})
+    consult_ppu: bool = False
 
 
 def _subagent_fallback_targets(sub_spec: Any | None) -> tuple[FallbackTarget, ...]:
@@ -1098,8 +1101,9 @@ def _subagent_fallback_targets(sub_spec: Any | None) -> tuple[FallbackTarget, ..
     Read the ordered cross-harness fallback targets from a sub-agent spec.
 
     Reads ``executor.config.fallback`` — either one mapping or an ordered
-    list of mappings, each ``{harness: str, model: str?, on: [str]?}``
-    (``on`` defaults to ``["quota"]``). Mirrors the dict-or-attr config
+    list of mappings, each ``{harness: str, model: str?, on: [str]?,
+    consult_ppu: bool?}`` (``on`` defaults to ``["quota"]``,
+    ``consult_ppu`` to ``false``). Mirrors the dict-or-attr config
     access of :func:`_subagent_allowed_harnesses`. Malformed entries are
     skipped, never raised: a bad fallback block must not break normal
     dispatch of the sub-agent itself.
@@ -1146,7 +1150,12 @@ def _subagent_fallback_targets(sub_spec: Any | None) -> tuple[FallbackTarget, ..
             on = on & TURN_ERROR_KINDS
             if not on:
                 continue
-        targets.append(FallbackTarget(harness=harness.strip(), model=model, on=on))
+        raw_consult = entry.get("consult_ppu", False)
+        if not isinstance(raw_consult, bool):
+            continue
+        targets.append(
+            FallbackTarget(harness=harness.strip(), model=model, on=on, consult_ppu=raw_consult)
+        )
     return tuple(targets)
 
 
@@ -2000,6 +2009,74 @@ async def tombstone_superseded_subagent_child(
     return None
 
 
+# PPU consent oracle: a fallback target with ``consult_ppu: true`` may only
+# dispatch while pay-per-use spend is affirmatively approved. Consulted live
+# at failure time (never cached) so a mid-flight budget/health change is
+# honored on the very next fallback attempt.
+_PPU_ORACLE_URL_ENV = "OMNIGENT_PPU_ORACLE_URL"
+_PPU_ORACLE_DEFAULT_URL = "http://localhost:5151/quota"
+_PPU_ORACLE_TIMEOUT_S = 2.0
+
+
+def _ppu_oracle_payload_eligible(payload: Any) -> tuple[bool, str]:
+    """
+    Decide PPU eligibility from an oracle response body.
+
+    Mirrors the goettl-core ``ppu_eligible`` contract: eligible ONLY when
+    ``ppu.anthropic.enabled`` is exactly ``true``, ``ppu.anthropic.health
+    .status`` is ``"up"``, and ``ppu.anthropic.budget.budget_ok`` is
+    exactly ``true``. Any missing or malformed shape is ineligible —
+    consent must be affirmative, never assumed.
+
+    :param payload: The decoded JSON response body.
+    :returns: ``(eligible, reason)`` — the reason names the failing check
+        when ineligible.
+    """
+    if not isinstance(payload, dict):
+        return False, "oracle response is not a JSON object"
+    ppu = payload.get("ppu")
+    anthropic = ppu.get("anthropic") if isinstance(ppu, dict) else None
+    if not isinstance(anthropic, dict):
+        return False, "ppu.anthropic missing or not an object"
+    if anthropic.get("enabled") is not True:
+        return False, "ppu.anthropic.enabled is not true"
+    health = anthropic.get("health")
+    if not isinstance(health, dict) or health.get("status") != "up":
+        return False, "ppu.anthropic.health.status is not 'up'"
+    budget = anthropic.get("budget")
+    if not isinstance(budget, dict) or budget.get("budget_ok") is not True:
+        return False, "ppu.anthropic.budget.budget_ok is not true"
+    return True, "eligible"
+
+
+async def _consult_ppu_oracle() -> tuple[bool, str]:
+    """
+    Live-read the PPU consent oracle for pay-per-use fallback eligibility.
+
+    GETs ``$OMNIGENT_PPU_ORACLE_URL`` (default
+    ``http://localhost:5151/quota``) with a 2s timeout. Fail-closed: an
+    unreachable oracle, non-200 status, or undecodable body denies
+    consent rather than granting it.
+
+    :returns: ``(eligible, reason)`` per
+        :func:`_ppu_oracle_payload_eligible`; transport/status failures
+        carry their own reason.
+    """
+    url = os.environ.get(_PPU_ORACLE_URL_ENV) or _PPU_ORACLE_DEFAULT_URL
+    try:
+        async with httpx.AsyncClient(timeout=_PPU_ORACLE_TIMEOUT_S) as client:
+            resp = await client.get(url)
+    except Exception as exc:  # noqa: BLE001 — any transport failure denies consent
+        return False, f"oracle unreachable: {type(exc).__name__}"
+    if resp.status_code != 200:
+        return False, f"oracle returned HTTP {resp.status_code}"
+    try:
+        payload = resp.json()
+    except ValueError:
+        return False, "oracle response is not valid JSON"
+    return _ppu_oracle_payload_eligible(payload)
+
+
 @dataclass(frozen=True)
 class FallbackDispatchResult:
     """
@@ -2038,8 +2115,11 @@ async def dispatch_subagent_fallback_target(
     native children) with the target's harness/model overrides, replays the
     original user message, and registers a work entry that keeps the
     original ``work_id`` so the eventual completion lands in the parent
-    inbox as the same piece of work. The caller must have freed the failed
-    child's ``(parent, title)`` slot first (see
+    inbox as the same piece of work. A ``consult_ppu`` target is dispatched
+    only when the PPU consent oracle grants eligibility at call time (a
+    denial returns an error result, so the engine skips to the next
+    candidate). The caller must have freed the failed child's
+    ``(parent, title)`` slot first (see
     :func:`tombstone_superseded_subagent_child`).
 
     :param server_client: httpx client pointed at the Omnigent server.
@@ -2068,6 +2148,18 @@ async def dispatch_subagent_fallback_target(
     model, model_error = _validated_fallback_model(target)
     if model_error is not None:
         return FallbackDispatchResult(error=model_error, child_session_id=None)
+
+    # PPU-gated target: consult the consent oracle NOW (live read at
+    # failure time), before any server-side mutation for this candidate.
+    # Denied consent skips the candidate; the engine tries the next one.
+    if target.consult_ppu:
+        eligible, reason = await _consult_ppu_oracle()
+        if not eligible:
+            _logger.info("fallback candidate skipped: PPU consent not granted (%s)", reason)
+            return FallbackDispatchResult(
+                error=f"Error: PPU consent not granted ({reason})",
+                child_session_id=None,
+            )
 
     parent_agent_id = _runner_app.get_session_agent_id(parent_session_id)
     if parent_agent_id is None:

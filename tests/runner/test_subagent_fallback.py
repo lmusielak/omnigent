@@ -21,11 +21,18 @@ from collections.abc import Iterator
 from types import SimpleNamespace
 from typing import Any
 
+import httpx
 import pytest
 
+from omnigent.errors import OmnigentError
 from omnigent.runner import app as runner_app
 from omnigent.runner import create_runner_app
-from omnigent.runner.tool_dispatch import FallbackTarget, _subagent_fallback_targets
+from omnigent.runner.tool_dispatch import (
+    FallbackTarget,
+    _consult_ppu_oracle,
+    _ppu_oracle_payload_eligible,
+    _subagent_fallback_targets,
+)
 from omnigent.spec import parser as spec_parser
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.turn_errors import classify_turn_error_kind
@@ -174,6 +181,20 @@ def test_fallback_targets_absent_or_stringified_yield_empty() -> None:
     assert _subagent_fallback_targets(_spec_with_fallback("{'harness': 'pi'}")) == ()
 
 
+def test_fallback_targets_consult_ppu_parsed_defaults_false_non_bool_skipped() -> None:
+    spec = _spec_with_fallback(
+        [
+            {"harness": "pi", "consult_ppu": True},
+            {"harness": "claude-native"},  # absent -> False
+            {"harness": "codex-native", "consult_ppu": "yes"},  # non-bool -> skipped
+        ]
+    )
+    assert _subagent_fallback_targets(spec) == (
+        FallbackTarget(harness="pi", on=frozenset({"quota"}), consult_ppu=True),
+        FallbackTarget(harness="claude-native", on=frozenset({"quota"}), consult_ppu=False),
+    )
+
+
 # ── Unit: parser keeps the structured executor.config keys ────────────
 
 
@@ -219,17 +240,179 @@ def test_parse_yaml_fallback_block_survives_end_to_end(tmp_path: Any) -> None:
         "      - harness: pi\n"
         "        model: google/gemini-2.5-pro\n"
         "        on: [quota, auth]\n"
+        "        consult_ppu: true\n"
     )
     spec = spec_parser.parse(tmp_path)
     assert spec.executor.config["allowed_harnesses"] == ["pi"]
     assert spec.executor.config["fallback"] == [
-        {"harness": "pi", "model": "google/gemini-2.5-pro", "on": ["quota", "auth"]}
+        {
+            "harness": "pi",
+            "model": "google/gemini-2.5-pro",
+            "on": ["quota", "auth"],
+            "consult_ppu": True,
+        }
     ]
     assert _subagent_fallback_targets(spec) == (
         FallbackTarget(
-            harness="pi", model="google/gemini-2.5-pro", on=frozenset({"quota", "auth"})
+            harness="pi",
+            model="google/gemini-2.5-pro",
+            on=frozenset({"quota", "auth"}),
+            consult_ppu=True,
         ),
     )
+
+
+def test_parse_executor_rejects_non_bool_consult_ppu() -> None:
+    """consult_ppu gates real spend, so a mistyped value fails at parse time."""
+    for bad in ("yes", 1, None, [True]):
+        with pytest.raises(OmnigentError, match="consult_ppu must be a boolean"):
+            spec_parser._parse_executor(
+                {
+                    "type": "omnigent",
+                    "config": {"fallback": {"harness": "pi", "consult_ppu": bad}},
+                }
+            )
+    # List form is validated entry-by-entry.
+    with pytest.raises(OmnigentError, match="consult_ppu must be a boolean"):
+        spec_parser._parse_executor(
+            {
+                "type": "omnigent",
+                "config": {
+                    "fallback": [
+                        {"harness": "pi", "consult_ppu": True},
+                        {"harness": "claude-native", "consult_ppu": "false"},
+                    ]
+                },
+            }
+        )
+
+
+# ── Unit: PPU consent oracle (consult_ppu gate) ───────────────────────
+
+
+def _eligible_ppu_payload() -> dict[str, Any]:
+    return {
+        "ppu": {
+            "anthropic": {
+                "enabled": True,
+                "health": {"status": "up"},
+                "budget": {"budget_ok": True},
+            }
+        }
+    }
+
+
+def _ppu_payload_with(**anthropic_overrides: Any) -> dict[str, Any]:
+    payload = _eligible_ppu_payload()
+    payload["ppu"]["anthropic"].update(anthropic_overrides)
+    return payload
+
+
+def test_ppu_payload_eligible_only_on_exact_contract() -> None:
+    assert _ppu_oracle_payload_eligible(_eligible_ppu_payload()) == (True, "eligible")
+
+
+@pytest.mark.parametrize(
+    ("payload", "reason_fragment"),
+    [
+        (["not", "a", "dict"], "not a JSON object"),
+        ({}, "ppu.anthropic missing"),
+        ({"ppu": "anthropic"}, "ppu.anthropic missing"),
+        ({"ppu": {"anthropic": "yes"}}, "ppu.anthropic missing"),
+        (_ppu_payload_with(enabled=False), "enabled is not true"),
+        # Exact-type checks: truthy non-bools are not consent.
+        (_ppu_payload_with(enabled=1), "enabled is not true"),
+        (_ppu_payload_with(enabled="true"), "enabled is not true"),
+        (_ppu_payload_with(health={"status": "down"}), "health.status is not 'up'"),
+        (_ppu_payload_with(health="up"), "health.status is not 'up'"),
+        (_ppu_payload_with(health={}), "health.status is not 'up'"),
+        (_ppu_payload_with(budget={"budget_ok": False}), "budget_ok is not true"),
+        (_ppu_payload_with(budget={"budget_ok": "true"}), "budget_ok is not true"),
+        (_ppu_payload_with(budget=None), "budget_ok is not true"),
+    ],
+)
+def test_ppu_payload_ineligible_shapes(payload: Any, reason_fragment: str) -> None:
+    """Any missing/malformed shape is ineligible — consent is never assumed."""
+    eligible, reason = _ppu_oracle_payload_eligible(payload)
+    assert eligible is False
+    assert reason_fragment in reason
+
+
+def _patch_oracle_http(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    status_code: int = 200,
+    payload: Any = None,
+    invalid_json: bool = False,
+    exc: Exception | None = None,
+) -> list[str]:
+    """Replace httpx.AsyncClient with a canned oracle; returns requested URLs."""
+    requested: list[str] = []
+
+    class _Response:
+        def __init__(self) -> None:
+            self.status_code = status_code
+
+        def json(self) -> Any:
+            if invalid_json:
+                raise ValueError("not json")
+            return payload
+
+    class _Client:
+        def __init__(self, **kwargs: Any) -> None:
+            del kwargs
+
+        async def __aenter__(self) -> _Client:
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            return None
+
+        async def get(self, url: str) -> _Response:
+            requested.append(url)
+            if exc is not None:
+                raise exc
+            return _Response()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    return requested
+
+
+@pytest.mark.asyncio
+async def test_consult_ppu_oracle_eligible_uses_default_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OMNIGENT_PPU_ORACLE_URL", raising=False)
+    requested = _patch_oracle_http(monkeypatch, payload=_eligible_ppu_payload())
+    assert await _consult_ppu_oracle() == (True, "eligible")
+    assert requested == ["http://localhost:5151/quota"]
+
+
+@pytest.mark.asyncio
+async def test_consult_ppu_oracle_honors_env_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OMNIGENT_PPU_ORACLE_URL", "http://oracle.test:9999/quota")
+    requested = _patch_oracle_http(monkeypatch, payload=_eligible_ppu_payload())
+    assert await _consult_ppu_oracle() == (True, "eligible")
+    assert requested == ["http://oracle.test:9999/quota"]
+
+
+@pytest.mark.asyncio
+async def test_consult_ppu_oracle_fails_closed_on_transport_and_body_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """500, timeout, and malformed JSON all deny consent, never grant it."""
+    _patch_oracle_http(monkeypatch, status_code=500)
+    eligible, reason = await _consult_ppu_oracle()
+    assert (eligible, reason) == (False, "oracle returned HTTP 500")
+
+    _patch_oracle_http(monkeypatch, exc=httpx.ConnectTimeout("timed out"))
+    eligible, reason = await _consult_ppu_oracle()
+    assert eligible is False
+    assert "oracle unreachable: ConnectTimeout" in reason
+
+    _patch_oracle_http(monkeypatch, invalid_json=True)
+    eligible, reason = await _consult_ppu_oracle()
+    assert (eligible, reason) == (False, "oracle response is not valid JSON")
 
 
 # ── E2E: native failure → fallback re-dispatch → inbox delivery ───────
@@ -966,3 +1149,177 @@ async def test_failed_message_post_closes_replacement_child(
     assert items[0]["status"] == "failed"
     assert QUOTA_OUTPUT in items[0]["output"]
     assert "skipped" in items[0]["output"]
+
+
+# ── E2E: consult_ppu-gated fallback targets ───────────────────────────
+
+
+_PPU_GATED_PI_TARGETS = (
+    FallbackTarget(
+        harness="pi", model="google/gemini-2.5-pro", on=frozenset({"quota"}), consult_ppu=True
+    ),
+)
+
+
+def _patch_consult_ppu(
+    monkeypatch: pytest.MonkeyPatch, *, eligible: bool, reason: str = "eligible"
+) -> list[tuple[bool, str]]:
+    """Replace the oracle consult seam with a canned verdict; returns the call log."""
+    calls: list[tuple[bool, str]] = []
+
+    async def _consult() -> tuple[bool, str]:
+        calls.append((eligible, reason))
+        return (eligible, reason)
+
+    monkeypatch.setattr("omnigent.runner.tool_dispatch._consult_ppu_oracle", _consult)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_consult_ppu_eligible_oracle_allows_fallback_spawn(
+    _clean_subagent_registry: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A consult_ppu target spawns normally when the oracle grants consent."""
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_install.missing_harness_cli", lambda harness: None
+    )
+    consults = _patch_consult_ppu(monkeypatch, eligible=True)
+    _register_failed_dispatch(fallback_targets=_PPU_GATED_PI_TARGETS)
+    server = _FallbackServerClient()
+    app = _build_app(server, _parent_spec(_reviewer_spec(None)))
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            f"/v1/sessions/{CHILD_SESSION_ID}/events",
+            json={
+                "type": "external_session_status",
+                "data": {"status": "failed", "output": QUOTA_OUTPUT, "error_kind": "quota"},
+            },
+        )
+        assert resp.status_code == 204
+        await _wait_for(lambda: server.created_sessions)
+
+    assert len(consults) == 1, "the oracle is consulted exactly once per candidate"
+    assert _drain_parent_inbox() == []
+    create_body = server.created_sessions[0]
+    assert create_body["harness_override"] == "pi"
+    assert create_body["model_override"] == "google/gemini-2.5-pro"
+
+
+@pytest.mark.asyncio
+async def test_consult_ppu_denied_skips_candidate_and_failure_stands(
+    _clean_subagent_registry: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Denied consent on the only target: no spawn, original failure delivers.
+
+    Covers every denial flavor via the seam (enabled false / budget_ok
+    false / health down / HTTP 500 / timeout / malformed body all reduce
+    to an ineligible verdict — the flavors are unit-tested above).
+    """
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_install.missing_harness_cli", lambda harness: None
+    )
+    consults = _patch_consult_ppu(
+        monkeypatch, eligible=False, reason="ppu.anthropic.budget.budget_ok is not true"
+    )
+    _register_failed_dispatch(fallback_targets=_PPU_GATED_PI_TARGETS)
+    server = _FallbackServerClient()
+    app = _build_app(server, _parent_spec(_reviewer_spec(None)))
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            f"/v1/sessions/{CHILD_SESSION_ID}/events",
+            json={
+                "type": "external_session_status",
+                "data": {"status": "failed", "output": QUOTA_OUTPUT, "error_kind": "quota"},
+            },
+        )
+        assert resp.status_code == 204
+        inbox = runner_app._session_inboxes_ref[PARENT_SESSION_ID]
+        await _wait_for(lambda: not inbox.empty())
+
+    assert len(consults) == 1
+    assert server.created_sessions == [], "a denied candidate must not be spawned"
+    items = _drain_parent_inbox()
+    assert len(items) == 1
+    payload = items[0]
+    assert payload["status"] == "failed"
+    assert QUOTA_OUTPUT in payload["output"]
+    assert "[fallback history]" in payload["output"]
+    assert "PPU consent not granted" in payload["output"]
+    assert "budget_ok is not true" in payload["output"]
+    assert runner_app._pending_subagent_fallbacks == {}
+
+
+@pytest.mark.asyncio
+async def test_consult_ppu_denied_continues_to_next_candidate(
+    _clean_subagent_registry: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A denied gated target yields to the next (ungated) candidate."""
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_install.missing_harness_cli", lambda harness: None
+    )
+    consults = _patch_consult_ppu(
+        monkeypatch, eligible=False, reason="ppu.anthropic.enabled is not true"
+    )
+    targets = (
+        *_PPU_GATED_PI_TARGETS,
+        FallbackTarget(harness="claude-native", on=frozenset({"quota"})),
+    )
+    _register_failed_dispatch(fallback_targets=targets)
+    server = _FallbackServerClient()
+    app = _build_app(server, _parent_spec(_reviewer_spec(None)))
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            f"/v1/sessions/{CHILD_SESSION_ID}/events",
+            json={
+                "type": "external_session_status",
+                "data": {"status": "failed", "output": QUOTA_OUTPUT, "error_kind": "quota"},
+            },
+        )
+        assert resp.status_code == 204
+        await _wait_for(lambda: server.created_sessions)
+
+    # Only the gated first candidate consulted the oracle; the ungated
+    # second candidate dispatched without one.
+    assert len(consults) == 1
+    assert _drain_parent_inbox() == []
+    create_body = server.created_sessions[0]
+    assert create_body["harness_override"] == "claude-native"
+    new_entry = runner_app.get_subagent_work(FALLBACK_CHILD_SESSION_ID)
+    assert new_entry is not None
+    assert "PPU consent not granted" in "\n".join(new_entry.fallback_history)
+
+
+@pytest.mark.asyncio
+async def test_consult_ppu_absent_makes_no_oracle_call(
+    _clean_subagent_registry: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ungated targets keep today's behavior: fallback spawns, oracle untouched."""
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_install.missing_harness_cli", lambda harness: None
+    )
+    consults = _patch_consult_ppu(monkeypatch, eligible=True)
+    _register_failed_dispatch(fallback_targets=_PI_GEMINI_TARGETS)  # consult_ppu absent
+    server = _FallbackServerClient()
+    app = _build_app(server, _parent_spec(_reviewer_spec(None)))
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            f"/v1/sessions/{CHILD_SESSION_ID}/events",
+            json={
+                "type": "external_session_status",
+                "data": {"status": "failed", "output": QUOTA_OUTPUT, "error_kind": "quota"},
+            },
+        )
+        assert resp.status_code == 204
+        await _wait_for(lambda: server.created_sessions)
+
+    assert consults == [], "an ungated target must never consult the oracle"
+    assert _drain_parent_inbox() == []
+    assert server.created_sessions[0]["harness_override"] == "pi"

@@ -320,7 +320,17 @@ executor:
         model: google/gemini-2.5-pro     # optional; harness default when omitted
         on: [quota]                      # optional; "quota" | "auth" | "generic"
                                          # (defaults to [quota])
+        consult_ppu: true                # optional (defaults to false); gate this
+                                         # target on the PPU consent oracle
 ```
+
+A target with `consult_ppu: true` is dispatched only when the PPU consent
+oracle (`$OMNIGENT_PPU_ORACLE_URL`, default `http://localhost:5151/quota`)
+grants pay-per-use eligibility at failure time — a live read, never cached.
+Eligibility requires an HTTP 200 JSON body with `ppu.anthropic.enabled` and
+`ppu.anthropic.budget.budget_ok` exactly `true` and
+`ppu.anthropic.health.status` equal to `"up"`; anything else (including an
+unreachable oracle) skips the target and the engine moves to the next one.
 
 The fallback sits ABOVE the per-harness `retry:` policy (which retries
 transport-level request failures within one harness) and the executor's own

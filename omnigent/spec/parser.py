@@ -526,6 +526,7 @@ def _parse_executor(
             str(k): (v if k in _STRUCTURED_EXECUTOR_CONFIG_KEYS else str(v))
             for k, v in raw_config.items()
         }
+    _validate_fallback_consult_ppu(config.get("fallback"))
     # Top-level ``executor.profile`` populates the concrete
     # ``ExecutorSpec.profile`` field for every executor type. For
     # ``omnigent`` we ALSO mirror it into ``config["profile"]``
@@ -562,6 +563,31 @@ def _parse_executor(
         context_window=context_window,
         auth=auth,
     )
+
+
+def _validate_fallback_consult_ppu(raw: Any) -> None:  # type: ignore[explicit-any]
+    """
+    Reject a non-boolean ``consult_ppu`` on ``executor.config.fallback``.
+
+    The runner's fallback reader silently skips malformed entries (a bad
+    block must not break normal dispatch), but ``consult_ppu`` gates real
+    pay-per-use spend: a mistyped value must fail loudly at parse time
+    rather than silently drop the target's consent gate.
+
+    :param raw: The structured ``fallback`` value from ``executor.config``
+        (one mapping, a list of mappings, or anything else), or ``None``.
+    :raises OmnigentError: If an entry carries a non-boolean
+        ``consult_ppu``.
+    """
+    entries = raw if isinstance(raw, (list, tuple)) else [raw]
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if "consult_ppu" in entry and not isinstance(entry.get("consult_ppu"), bool):
+            raise OmnigentError(
+                "executor.config.fallback: consult_ppu must be a boolean, e.g. consult_ppu: true",
+                code=ErrorCode.INVALID_INPUT,
+            )
 
 
 def _parse_executor_auth(
