@@ -65,6 +65,31 @@ def test_classifier_quota_by_code_and_text() -> None:
     assert classify_turn_error_kind("request was rate-limited") == "quota"
 
 
+def test_classifier_monthly_spend_limit_is_quota() -> None:
+    """Anthropic's subscription monthly-spend hard-stop is a quota failure."""
+    # API error body wording (rate_limit_error).
+    assert (
+        classify_turn_error_kind(
+            "This request would exceed your account's monthly spend limit. Please try again later."
+        )
+        == "quota"
+    )
+    # Claude Code surface wording.
+    assert (
+        classify_turn_error_kind(
+            "You've hit your org's monthly spend limit · run /usage-credits to raise it"
+        )
+        == "quota"
+    )
+    assert classify_turn_error_kind("monthly spend limit reached") == "quota"
+
+
+def test_classifier_spend_adjacent_prose_stays_generic() -> None:
+    """Anchor check: spend wording without the full phrase is not quota."""
+    assert classify_turn_error_kind("spending review") == "generic"
+    assert classify_turn_error_kind("spend limit discussion in budget doc") == "generic"
+
+
 def test_classifier_auth_by_code_and_text() -> None:
     assert classify_turn_error_kind(None, 401) == "auth"
     assert classify_turn_error_kind(None, 403) == "auth"

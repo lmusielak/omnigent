@@ -42,6 +42,11 @@ QUOTA_ERROR_FRAGMENTS: tuple[str, ...] = (
     "quota_exceeded",
     "insufficient_quota",
     "out of quota",
+    # Anthropic subscription spend hard-stop (API rate_limit_error body and
+    # the Claude Code "org's monthly spend limit" surface string). Anchored
+    # on "monthly": bare "spend limit" would false-positive on prose.
+    "monthly spend limit",
+    "account's monthly spend limit",
     "too many requests",
     "resource_exhausted",
     "resource exhausted",
