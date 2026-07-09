@@ -964,6 +964,100 @@ def _create_artifact_store(location: str) -> Any:  # type: ignore[explicit-any] 
     return LocalArtifactStore(location)
 
 
+class _UnstableAgentSourceError(Exception):
+    """Raised when a git-backed ``--agent`` source cannot yield a stable snapshot.
+
+    Signals that the source repo is mid-operation (rebase/merge/cherry-pick
+    in flight, detached HEAD) or that ``HEAD`` kept moving while the
+    snapshot was taken. :func:`_preregister_agent` maps this to its refusal
+    semantics: keep the existing snapshot on re-registration, fail loud on
+    a first registration.
+    """
+
+
+def _materialize_stable_snapshot(agent_source: Path, dest: Path) -> tuple[Path, str | None]:
+    """
+    Materialize *agent_source* into *dest*, race-free for git sources.
+
+    Non-git sources go straight through :func:`omnigent.spec
+    .materialize_bundle`. Git sources run a check-then-snapshot sequence
+    that closes the TOCTOU window around a concurrent rebase/checkout:
+    (1) resolve ``HEAD``, (2) refuse if the repo is mid-operation,
+    (3) archive by the pinned sha (immutable — the content itself can
+    never tear), (4) re-check: if ``HEAD`` moved or a mid-operation state
+    appeared, discard and retry once, then refuse.
+
+    :param agent_source: The ``--agent`` source directory or YAML file.
+    :param dest: Destination bundle directory (inside a tempdir).
+    :returns: ``(bundle_dir, snapshot_sha)`` — the sha is ``None`` for
+        non-git sources.
+    :raises _UnstableAgentSourceError: If the source repo is
+        mid-operation or ``HEAD`` moved during both snapshot attempts.
+    """
+    from omnigent.spec import git_head_sha, git_mid_operation_state, materialize_bundle
+
+    reason = ""
+    for _attempt in range(2):
+        sha = git_head_sha(agent_source)
+        if sha is None:
+            return materialize_bundle(agent_source, dest), None
+        mid = git_mid_operation_state(agent_source)
+        if mid is not None:
+            raise _UnstableAgentSourceError(f"{agent_source}: {mid}")
+        bundle_dir = materialize_bundle(agent_source, dest, pinned_git_sha=sha)
+        post_mid = git_mid_operation_state(agent_source)
+        post_sha = git_head_sha(agent_source)
+        if post_mid is None and post_sha == sha:
+            return bundle_dir, sha
+        reason = post_mid or f"HEAD moved {sha[:8]} -> {(post_sha or 'unknown')[:8]} mid-snapshot"
+        shutil.rmtree(dest, ignore_errors=True)
+    raise _UnstableAgentSourceError(f"{agent_source}: {reason} (after retry)")
+
+
+def _probe_agent_source_name(agent_source: Path) -> str | None:
+    """
+    Best-effort read of the spec ``name`` straight from the source.
+
+    Used only on the snapshot-refusal path, where the source cannot be
+    materialized/loaded: the name is needed to check whether the agent is
+    already registered (keep the existing snapshot) or new (fail loud).
+    Reads ``config.yaml`` for a directory source (falling back to the
+    single-file omnigent YAML shape) or the YAML file itself. The
+    committed copy (``git show HEAD:…``) is preferred over the working
+    file — on this path the source is mid-operation, so the working file
+    may be torn (e.g. carry conflict markers).
+
+    :param agent_source: The ``--agent`` source directory or YAML file.
+    :returns: The declared ``name``, or ``None`` when it cannot be read —
+        callers treat that as a first registration (the fail-safe branch).
+    """
+    from omnigent.spec import _find_omnigent_yaml_in_dir, _git_output
+
+    candidate: Path | None = None
+    if agent_source.is_dir():
+        config = agent_source / "config.yaml"
+        candidate = config if config.is_file() else _find_omnigent_yaml_in_dir(agent_source)
+    elif agent_source.is_file():
+        candidate = agent_source
+    if candidate is None:
+        return None
+    texts: list[str] = []
+    committed = _git_output(candidate.parent, "show", f"HEAD:./{candidate.name}")
+    if committed:
+        texts.append(committed)
+    with contextlib.suppress(OSError):
+        texts.append(candidate.read_text())
+    for text in texts:
+        try:
+            data = yaml.safe_load(text)
+        except yaml.YAMLError:
+            continue
+        name = data.get("name") if isinstance(data, dict) else None
+        if isinstance(name, str):
+            return name
+    return None
+
+
 def _preregister_agent(  # type: ignore[explicit-any]  # agent_store / artifact_store / agent_cache typed Any to avoid import cycle
     agent_source: Path,
     agent_store: Any,
@@ -993,18 +1087,45 @@ def _preregister_agent(  # type: ignore[explicit-any]  # agent_store / artifact_
         newly-added local-tool files (or other bundle edits) are
         silently ignored on the next request.
     :returns: The registered agent id, or ``None`` if the source
-        spec has no name and is skipped.
+        spec has no name and is skipped. When a git-backed source is
+        mid-operation (rebase/merge in flight, detached HEAD) or its
+        ``HEAD`` keeps moving, re-registration keeps the existing
+        snapshot (logged as ERROR) and returns the existing id.
+    :raises click.ClickException: If a git-backed source is unstable
+        and the agent is not registered yet — better no host than a
+        torn registry.
     """
     import gzip
     import hashlib
     import io
+    import logging
     import tarfile
 
     from omnigent.db.utils import generate_agent_id
-    from omnigent.spec import load, materialize_bundle
+    from omnigent.spec import load
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        bundle_dir = materialize_bundle(agent_source, Path(tmpdir) / "bundle")
+        try:
+            bundle_dir, snapshot_sha = _materialize_stable_snapshot(
+                agent_source, Path(tmpdir) / "bundle"
+            )
+        except _UnstableAgentSourceError as exc:
+            # Fail-safe split: a registered agent keeps serving its
+            # known-good snapshot; a first registration fails loud.
+            name = _probe_agent_source_name(agent_source)
+            existing = agent_store.get_by_name(name) if name is not None else None
+            if existing is not None:
+                logging.getLogger(__name__).error(
+                    "registry source mid-operation (%s); keeping snapshot %s for agent %r",
+                    exc,
+                    existing.bundle_location,
+                    name,
+                )
+                click.echo(f"  agent: {name} (kept existing snapshot; source unstable: {exc})")
+                return cast(str, existing.id)
+            raise click.ClickException(
+                f"refusing to register agent from unstable git source: {exc}"
+            ) from exc
 
         # Build tarball in memory from the materialized bundle dir.
         # ``arcname="."`` puts the contents at the tarball root so
@@ -1040,6 +1161,9 @@ def _preregister_agent(  # type: ignore[explicit-any]  # agent_store / artifact_
     # the bundle in place and only refresh
     # ``bundle_location`` when the content hash actually
     # changed so the row stays stable across no-op restarts.
+    source_desc = (
+        f"{agent_source} @ {snapshot_sha[:8]}" if snapshot_sha is not None else str(agent_source)
+    )
     bundle_hash = hashlib.sha256(bundle_bytes).hexdigest()
     existing = agent_store.get_by_name(spec.name)
     if existing is not None:
@@ -1057,7 +1181,7 @@ def _preregister_agent(  # type: ignore[explicit-any]  # agent_store / artifact_
             # ``--agent`` registers operator-authored template agents,
             # so ${VAR} may expand against the server env here.
             agent_cache.replace(existing.id, new_loc, bundle_bytes, expand_env=True)
-        click.echo(f"  agent: {spec.name} (from {agent_source})")
+        click.echo(f"  agent: {spec.name} (from {source_desc})")
         return cast(str, existing.id)
 
     agent_id = generate_agent_id()
@@ -1069,7 +1193,7 @@ def _preregister_agent(  # type: ignore[explicit-any]  # agent_store / artifact_
         bundle_location=loc,
         description=spec.description,
     )
-    click.echo(f"  agent: {spec.name} (from {agent_source})")
+    click.echo(f"  agent: {spec.name} (from {source_desc})")
     return agent_id
 
 

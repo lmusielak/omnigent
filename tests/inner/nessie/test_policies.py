@@ -9,6 +9,8 @@ the per-turn cap broken, or a worktree escape let through).
 
 from __future__ import annotations
 
+import logging
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -242,6 +244,105 @@ def test_blast_radius_safe_commands_allow(command: str) -> None:
     subcommand / flags.
     """
     assert _result(blast_radius()(_tool_call("Bash", command=command), {})) == "ALLOW"
+
+
+@pytest.mark.parametrize(
+    "command,expected",
+    [
+        # Churn against the protected tree — DENY in every spelling.
+        ("git -C /protected/tree rebase main", "DENY"),
+        ("git -C /protected/tree checkout main", "DENY"),
+        ("git -C /protected/tree switch other", "DENY"),
+        ("git -C /protected/tree reset --hard HEAD~1", "DENY"),
+        ("git -C /protected/tree branch -D topic", "DENY"),
+        ("git -C /protected/tree branch -f main HEAD~3", "DENY"),
+        ("git --git-dir=/protected/tree/.git checkout main", "DENY"),
+        ("git --work-tree /protected/tree reset --hard", "DENY"),
+        ("git worktree remove /protected/tree", "DENY"),
+        # A subdirectory of the protected tree is protected too.
+        ("git -C /protected/tree/sub rebase main", "DENY"),
+        # Chained statements are inspected per statement.
+        ("cd /tmp && git -C /protected/tree switch other", "DENY"),
+        # Non-ff merge/pull moves the tree unpredictably — DENY;
+        # the ff-only forms are the sanctioned way the tree moves.
+        ("git -C /protected/tree merge origin/main", "DENY"),
+        ("git -C /protected/tree pull origin main", "DENY"),
+        ("git -C /protected/tree merge --ff-only origin/main", "ALLOW"),
+        ("git -C /protected/tree pull --ff-only", "ALLOW"),
+        # Same churn against any OTHER tree stays allowed.
+        ("git -C /other/tree rebase main", "ALLOW"),
+        # Prefix safety: a sibling sharing the name prefix is NOT protected.
+        ("git -C /protected/tree-evil rebase main", "ALLOW"),
+        # Reads and safe branch ops on the protected tree stay allowed.
+        ("git -C /protected/tree status", "ALLOW"),
+        ("git -C /protected/tree log --oneline", "ALLOW"),
+        ("git -C /protected/tree branch -d merged-topic", "ALLOW"),
+    ],
+)
+def test_blast_radius_protected_trees_gates_git_churn(command: str, expected: str) -> None:
+    """
+    ``protected_trees`` denies git churn (checkout/switch/rebase/reset/
+    worktree remove/forced branch, non-ff merge/pull) against the protected
+    tree in ``-C`` / ``--git-dir`` / ``--work-tree`` / operand form, while
+    leaving the same commands against other trees — and reads against the
+    protected tree — untouched. A wrong DENY here stalls every legitimate
+    worktree flow; a wrong ALLOW re-opens the live-registry churn window.
+    """
+    evaluate = blast_radius(protected_trees=["/protected/tree"])
+    assert _result(evaluate(_tool_call("sys_os_shell", command=command), {})) == expected
+
+
+def test_blast_radius_protected_trees_unresolvable_target_allows_and_logs(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A bare churn command with no resolvable target (no ``-C`` /
+    ``--git-dir``; the policy event carries no cwd) must ALLOW — an
+    implementer's ``git rebase`` in its own worktree must not be blocked —
+    but the fail-open must be visible in the log, not silent.
+    """
+    evaluate = blast_radius(protected_trees=["/protected/tree"])
+    with caplog.at_level(logging.INFO, logger="omnigent.inner.nessie.policies"):
+        decision = evaluate(_tool_call("sys_os_shell", command="git rebase main"), {})
+    assert _result(decision) == "ALLOW"
+    assert any("target unresolvable" in r.message for r in caplog.records)
+    # A relative -C is equally unresolvable without the event cwd.
+    with caplog.at_level(logging.INFO, logger="omnigent.inner.nessie.policies"):
+        decision = evaluate(_tool_call("sys_os_shell", command="git -C subdir rebase main"), {})
+    assert _result(decision) == "ALLOW"
+
+
+def test_blast_radius_protected_trees_resolves_symlinks(tmp_path: Path) -> None:
+    """
+    A symlink pointing into the protected tree must not bypass the gate:
+    path comparison realpath-resolves both sides. Without this, one
+    ``ln -s`` defeats the whole guardrail.
+    """
+    protected = tmp_path / "protected"
+    protected.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(protected)
+
+    evaluate = blast_radius(protected_trees=[str(protected)])
+    decision = evaluate(_tool_call("sys_os_shell", command=f"git -C {alias} rebase main"), {})
+    assert _result(decision) == "DENY"
+
+
+def test_blast_radius_without_protected_trees_keeps_prior_behavior() -> None:
+    """
+    Rollback safety: the factory must work without the new argument, and
+    the default must leave git churn ungated — deploying the fork before
+    any config references ``protected_trees`` (or rolling the config back)
+    must not change a single verdict.
+    """
+    evaluate = blast_radius()
+    for command in (
+        "git -C /protected/tree rebase main",
+        "git -C /protected/tree checkout main",
+        "git worktree remove /protected/tree",
+        "git -C /protected/tree merge origin/main",
+    ):
+        assert _result(evaluate(_tool_call("sys_os_shell", command=command), {})) == "ALLOW"
 
 
 def test_spawn_bounds_caps_then_resets_per_turn() -> None:

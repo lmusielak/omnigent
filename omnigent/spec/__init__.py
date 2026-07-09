@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import io
 import logging
 import shutil
+import subprocess
+import tarfile
 from pathlib import Path
 
 from omnigent.errors import ErrorCode, OmnigentError
@@ -81,6 +84,8 @@ __all__ = [
     "ValidationResult",
     "expand_env_vars",
     "extract_safe",
+    "git_head_sha",
+    "git_mid_operation_state",
     "load",
     "materialize_bundle",
     "parse",
@@ -90,7 +95,176 @@ __all__ = [
 ]
 
 
-def materialize_bundle(source: Path, dest: Path) -> Path:
+def _git_output(source: Path, *args: str) -> str | None:
+    """
+    Run ``git -C <source> <args>`` and return its stripped stdout.
+
+    :param source: Directory the git command runs against (via ``-C``).
+    :param args: Git arguments, e.g. ``("rev-parse", "HEAD")``.
+    :returns: Stripped stdout on success; ``None`` on any failure —
+        git missing, non-zero exit, or a hung git killed by the
+        timeout. Callers treat ``None`` as "not a usable git source".
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(source), *args],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip()
+
+
+def git_head_sha(source: Path) -> str | None:
+    """
+    Resolve the commit sha of ``HEAD`` for the work tree containing *source*.
+
+    :param source: A directory that may live inside a git work tree.
+    :returns: The 40-char ``HEAD`` sha, or ``None`` when *source* is not a
+        directory inside a git work tree, git is unavailable, or ``HEAD``
+        does not resolve (e.g. an unborn branch). ``None`` means callers
+        should treat the source as a plain directory.
+    """
+    if not source.is_dir():
+        return None
+    if _git_output(source, "rev-parse", "--is-inside-work-tree") != "true":
+        return None
+    return _git_output(source, "rev-parse", "HEAD")
+
+
+def git_mid_operation_state(source: Path) -> str | None:
+    """
+    Describe why the work tree containing *source* is mid-operation.
+
+    A repo is mid-operation when a rebase, merge, or cherry-pick is in
+    flight, or ``HEAD`` is detached — states in which its checked-out tree
+    must not be trusted as a registration source. The state files are
+    resolved via ``git rev-parse --git-path``, which points into the
+    private gitdir of a linked worktree (``.git/worktrees/<name>/…``), so
+    detection works for worktrees as well as primary checkouts.
+
+    :param source: A directory that may live inside a git work tree.
+    :returns: A human-readable state description (e.g. ``"rebase in
+        progress (rebase-merge present)"`` or ``"detached HEAD"``), or
+        ``None`` when the tree is stable — including when *source* is not
+        a git work tree at all or git is unavailable.
+    """
+    state_files = {
+        "rebase-merge": "rebase",
+        "rebase-apply": "rebase",
+        "MERGE_HEAD": "merge",
+        "CHERRY_PICK_HEAD": "cherry-pick",
+    }
+    out = _git_output(source, "rev-parse", *(a for f in state_files for a in ("--git-path", f)))
+    if out is None:
+        return None
+    for (name, verb), rel in zip(state_files.items(), out.splitlines(), strict=False):
+        path = Path(rel)
+        if not path.is_absolute():
+            path = source / path
+        if path.exists():
+            return f"{verb} in progress ({name} present)"
+    if _git_output(source, "symbolic-ref", "-q", "HEAD") is None:
+        return "detached HEAD"
+    return None
+
+
+def _warn_paths_excluded_from_snapshot(source: Path, sha: str) -> None:
+    """
+    WARN about working-tree paths a git snapshot of *source* leaves out.
+
+    The registry is the committed state: dirty, untracked, and ignored
+    paths do not ship in a ``git archive`` snapshot. Listing them (bounded
+    to the first 20) tells a surprised operator exactly what didn't ship.
+    ``--no-optional-locks`` keeps the status read from touching the live
+    repo's index. Scoped to *source*'s subtree via the ``.`` pathspec.
+
+    :param source: The git-backed spec source directory.
+    :param sha: The snapshot commit sha, for the log line.
+    """
+    status = _git_output(
+        source, "--no-optional-locks", "status", "--porcelain", "--ignored=matching", "--", "."
+    )
+    if not status:
+        return
+    lines = status.splitlines()
+    shown = "; ".join(line.strip() for line in lines[:20])
+    suffix = f"; +{len(lines) - 20} more" if len(lines) > 20 else ""
+    _logger.warning(
+        "bundle for %s is the committed state at %.8s; %d working-tree path(s) "
+        "are NOT included (commit them to ship them): %s%s",
+        source,
+        sha,
+        len(lines),
+        shown,
+        suffix,
+    )
+
+
+def _materialize_from_git_snapshot(source: Path, dest: Path, sha: str) -> bool:
+    """
+    Extract the committed tree of *source* at *sha* into *dest*.
+
+    Reads ``git archive`` from the immutable object store, so a concurrent
+    rebase/checkout of the working tree cannot tear the copy. When *source*
+    is a subdirectory of the repo, only that subtree is archived
+    (``<sha>:<prefix>``) so *dest* has the same shape a copytree would.
+
+    :param source: A directory inside a git work tree.
+    :param dest: Destination directory to populate (created if needed).
+    :returns: ``True`` when *dest* was populated from the snapshot;
+        ``False`` on any git/extraction failure — the caller falls back to
+        the plain working-tree copy.
+    """
+    prefix = _git_output(source, "rev-parse", "--show-prefix")
+    toplevel = _git_output(source, "rev-parse", "--show-toplevel")
+    if prefix is None or not toplevel:
+        return False
+    treeish = f"{sha}:{prefix.rstrip('/')}" if prefix else sha
+    try:
+        # Archive from the repo toplevel: ``git archive`` implicitly scopes
+        # to its cwd, so running it inside a subdirectory with a subtree
+        # tree-ish would produce an empty archive.
+        proc = subprocess.run(
+            ["git", "-C", toplevel, "archive", "--format=tar", treeish],
+            capture_output=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if proc.returncode != 0:
+        _logger.warning(
+            "git snapshot of %s at %.8s failed (%s); falling back to a working-tree copy",
+            source,
+            sha,
+            proc.stderr.decode(errors="replace").strip(),
+        )
+        return False
+    dest.mkdir(parents=True, exist_ok=True)
+    try:
+        with tarfile.open(fileobj=io.BytesIO(proc.stdout)) as tar:
+            tar.extractall(dest, filter="data")
+    except (tarfile.TarError, OSError) as exc:
+        # Discard the partial extraction so the copytree fallback doesn't
+        # overlay working-tree files onto half a snapshot.
+        shutil.rmtree(dest, ignore_errors=True)
+        _logger.warning(
+            "extracting git snapshot of %s at %.8s failed (%s); "
+            "falling back to a working-tree copy",
+            source,
+            sha,
+            exc,
+        )
+        return False
+    _warn_paths_excluded_from_snapshot(source, sha)
+    return True
+
+
+def materialize_bundle(source: Path, dest: Path, *, pinned_git_sha: str | None = None) -> Path:
     """
     Copy a spec source into *dest* as a uniform bundle directory.
 
@@ -106,6 +280,13 @@ def materialize_bundle(source: Path, dest: Path) -> Path:
     returned path as a directory." No caller has to reinspect the
     input shape.
 
+    A directory source inside a git work tree is snapshotted from the
+    git object store (``git archive`` of ``HEAD``, or *pinned_git_sha*)
+    rather than copied from the working tree, so a concurrent
+    rebase/checkout cannot tear the bundle and uncommitted files never
+    ship (a WARNING lists what was excluded). Non-git sources, a missing
+    git binary, or any git failure fall back to the plain recursive copy.
+
     :param source: The spec source. Either a directory containing
         ``config.yaml`` (standard omnigent shape) or a standalone
         omnigent YAML file (e.g.
@@ -114,15 +295,23 @@ def materialize_bundle(source: Path, dest: Path) -> Path:
         does not exist; may be empty or already contain the copied
         contents from a prior call (``shutil.copytree`` is invoked
         with ``dirs_exist_ok=True``).
+    :param pinned_git_sha: Snapshot exactly this commit instead of
+        re-resolving ``HEAD``. Callers that need a check-then-snapshot
+        sequence to be race-free (``_preregister_agent``) resolve
+        :func:`git_head_sha` first and pin it here.
     :returns: *dest*, always as a populated directory. For the
-        directory case the contents are a recursive copy of
-        *source*. For the file case the YAML is placed at the root
+        directory case the contents are the committed tree at the
+        snapshot sha (git sources) or a recursive copy of *source*
+        (fallback). For the file case the YAML is placed at the root
         of *dest* so
         :func:`omnigent.spec._find_omnigent_yaml_in_dir` picks
         it up on a subsequent :func:`load` call.
     :raises FileNotFoundError: If *source* does not exist.
     """
     if source.is_dir():
+        sha = pinned_git_sha or git_head_sha(source)
+        if sha is not None and _materialize_from_git_snapshot(source, dest, sha):
+            return dest
         shutil.copytree(source, dest, dirs_exist_ok=True)
         return dest
     if source.is_file():
