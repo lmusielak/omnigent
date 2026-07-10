@@ -262,6 +262,39 @@ class AgentObject(BaseModel):
     builtin: bool = False
 
 
+class AgentModelInfo(BaseModel):
+    """
+    A registered agent's model pin and active operator override.
+
+    Returned by ``GET /v1/agents/models`` (Harness Status dashboard
+    consumption): one row per registered (built-in / template) agent
+    pairing the bundle-pinned model with the operator override the
+    next session for that agent name would actually receive.
+
+    :param agent_id: Unique agent identifier, e.g. ``"ag_abc123"``.
+    :param object: Fixed resource type, always ``"agent.model_info"``.
+    :param name: Human-readable agent name, e.g. ``"implementer"``.
+        The key the state file's ``agent_overrides`` map is matched on.
+    :param created_at: Unix epoch timestamp of registration.
+    :param pinned_model: The model pinned in the registered bundle's
+        root ``config.yaml`` (``executor.model``, backfilled from
+        ``llm.model`` by the spec parser), e.g.
+        ``"databricks-claude-sonnet-4-6"``. ``None`` when the spec
+        declares no model or the stored bundle cannot be loaded.
+    :param override_model: The validated active override for this
+        agent name from the Harness Status state file, or ``None``
+        when no usable override exists (absent or invalid — mirroring
+        exactly what session creation would apply).
+    """
+
+    agent_id: str
+    object: str = "agent.model_info"
+    name: str
+    created_at: int
+    pinned_model: str | None = None
+    override_model: str | None = None
+
+
 # ── Session Policies ───────────────────────────────────────────
 
 

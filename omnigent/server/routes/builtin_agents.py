@@ -16,6 +16,12 @@ built-ins, then creates a session with
 This is the read-only successor to the removed ``GET /api/agents`` list:
 there is intentionally no create/update/delete — agent writes happen
 through session creation.
+
+``GET /v1/agents/models`` is the companion read for the Harness Status
+dashboard: the same registered agents, each pairing the model pinned in
+its stored bundle with the active per-agent operator override from
+``~/.omnigent/harness-status-state.json`` (see
+``omnigent/agent_model_overrides.py``).
 """
 
 from __future__ import annotations
@@ -24,12 +30,19 @@ import logging
 
 from fastapi import APIRouter, Query, Request
 
+from omnigent.agent_model_overrides import load_agent_overrides, resolve_agent_model_override
 from omnigent.db.utils import builtin_agent_id
 from omnigent.entities import Agent
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import AuthProvider
 from omnigent.server.routes._auth_helpers import require_user as _require_user
-from omnigent.server.schemas import AgentObject, MCPServerSummary, PaginatedList, SkillSummary
+from omnigent.server.schemas import (
+    AgentModelInfo,
+    AgentObject,
+    MCPServerSummary,
+    PaginatedList,
+    SkillSummary,
+)
 from omnigent.stores import AgentStore
 
 _logger = logging.getLogger(__name__)
@@ -117,6 +130,38 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
     )
 
 
+def _pinned_model_for_agent(agent: Agent, agent_cache: AgentCache) -> str | None:
+    """
+    Return the model pinned in *agent*'s registered bundle.
+
+    Loads the stored bundle tar through the agent cache and reads the
+    root spec's ``executor.model`` — the parser's single source of
+    truth for the declared model (populated from ``executor.model`` or,
+    backward-compat, ``llm.model`` in the root ``config.yaml``).
+
+    Fail-open per agent, mirroring :func:`_to_agent_object`: one
+    unreadable bundle must not break the whole listing.
+
+    :param agent: The registered agent entity.
+    :param agent_cache: Cache used to load the stored bundle.
+    :returns: The pinned model id, e.g.
+        ``"databricks-claude-sonnet-4-6"``, or ``None`` when the spec
+        pins no model or the bundle cannot be loaded.
+    """
+    try:
+        loaded = agent_cache.load(
+            agent.id, agent.bundle_location, expand_env=agent.session_id is None
+        )
+    except Exception:  # noqa: BLE001 — spec load failure must not break the list
+        _logger.debug(
+            "Failed to load spec for agent %s; pinned_model will be null",
+            agent.id,
+            exc_info=True,
+        )
+        return None
+    return loaded.spec.executor.model
+
+
 def create_builtin_agents_router(
     agent_store: AgentStore,
     agent_cache: AgentCache,
@@ -136,6 +181,57 @@ def create_builtin_agents_router(
     :returns: A FastAPI router exposing the read-only list.
     """
     router = APIRouter()
+
+    # NB: registered before ``GET /agents`` only for readability — no
+    # route in this router carries a path param, so ordering is not
+    # load-bearing (unlike the ``/sessions/projects`` case).
+    @router.get("/agents/models")
+    async def list_agent_models(
+        request: Request,
+        limit: int = Query(default=1000, ge=1, le=1000),
+        after: str | None = Query(default=None),
+        before: str | None = Query(default=None),
+        order: str = Query(default="desc", pattern="^(asc|desc)$"),
+    ) -> PaginatedList:
+        """List registered agents' bundle-pinned models and active overrides.
+
+        Read-only Harness Status dashboard feed: for every registered
+        (``session_id IS NULL``) agent, pairs the model pinned in the
+        stored bundle's root ``config.yaml`` with the operator override
+        the next session for that agent name would receive from the
+        state file (``~/.omnigent/harness-status-state.json``, or
+        ``$OMNIGENT_OVERRIDES_PATH``). The state file is read once per
+        request — fresh, never cached across requests — so a dashboard
+        Save is visible immediately.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param limit: Maximum number of agents to return (1-1000);
+            defaults to the cap since the dashboard wants the fleet.
+        :param after: Cursor — return agents after this id.
+        :param before: Cursor — return agents before this id.
+        :param order: Sort order, ``"asc"`` or ``"desc"``.
+        :returns: A :class:`PaginatedList` of :class:`AgentModelInfo`.
+        """
+        _require_user(request, auth_provider)
+        page = agent_store.list(limit=limit, after=after, before=before, order=order)
+        # One consistent file read for the whole page; per-name
+        # validation mirrors exactly what session creation applies.
+        overrides = load_agent_overrides()
+        return PaginatedList(
+            data=[
+                AgentModelInfo(
+                    agent_id=agent.id,
+                    name=agent.name,
+                    created_at=agent.created_at,
+                    pinned_model=_pinned_model_for_agent(agent, agent_cache),
+                    override_model=resolve_agent_model_override(agent.name, overrides),
+                )
+                for agent in page.data
+            ],
+            first_id=page.first_id,
+            last_id=page.last_id,
+            has_more=page.has_more,
+        )
 
     @router.get("/agents")
     async def list_builtin_agents(

@@ -6280,6 +6280,99 @@
         ]
       }
     },
+    "/v1/agents/models": {
+      "get": {
+        "description": "List registered agents' bundle-pinned models and active overrides.\n\nRead-only Harness Status dashboard feed: for every registered\n(`session_id IS NULL`) agent, pairs the model pinned in the\nstored bundle's root `config.yaml` with the operator override\nthe next session for that agent name would receive from the\nstate file (`~/.omnigent/harness-status-state.json`, or\n`$OMNIGENT_OVERRIDES_PATH`). The state file is read once per\nrequest \u2014 fresh, never cached across requests \u2014 so a dashboard\nSave is visible immediately.\n\n**Returns:** A `PaginatedList` of `AgentModelInfo`.",
+        "operationId": "list_agent_models_v1_agents_models_get",
+        "parameters": [
+          {
+            "description": "Maximum number of agents to return (1-1000); defaults to the cap since the dashboard wants the fleet.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 1000,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Cursor \u2014 return agents after this id.",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          },
+          {
+            "description": "Cursor \u2014 return agents before this id.",
+            "in": "query",
+            "name": "before",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Before"
+            }
+          },
+          {
+            "description": "Sort order, `\"asc\"` or `\"desc\"`.",
+            "in": "query",
+            "name": "order",
+            "required": false,
+            "schema": {
+              "default": "desc",
+              "pattern": "^(asc|desc)$",
+              "title": "Order",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PaginatedList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Agent Models",
+        "tags": [
+          "agents"
+        ]
+      }
+    },
     "/v1/harnesses": {
       "get": {
         "operationId": "list_harnesses_v1_harnesses_get",
