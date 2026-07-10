@@ -405,6 +405,22 @@ def mock_llm() -> Iterator[ControllableMockClient]:
 
 
 @pytest.fixture(autouse=True)
+def _isolate_agent_overrides_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Point the agent-overrides state file at a nonexistent temp path.
+
+    Session creation reads the Harness Status dashboard's state file
+    (``~/.omnigent/harness-status-state.json``) fresh on every create
+    to seed per-agent model overrides. Without this isolation, a
+    developer machine's REAL state file would leak operator overrides
+    into every test that creates a session — a name collision away
+    from a flaky suite. Tests that exercise the seeding set the env
+    var themselves (see ``test_sessions_model_override_seed``).
+    """
+    monkeypatch.setenv("OMNIGENT_OVERRIDES_PATH", str(tmp_path / "no-agent-overrides.json"))
+
+
+@pytest.fixture(autouse=True)
 def _reset_elicitation_state() -> Iterator[None]:
     """
     Clear the module-global elicitation state after every test.

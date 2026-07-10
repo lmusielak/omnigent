@@ -57,6 +57,7 @@ from pydantic import TypeAdapter, ValidationError
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
+from omnigent.agent_model_overrides import resolve_agent_model_override
 from omnigent.codex_native_elicitation import codex_elicitation_id
 from omnigent.cost_plan import (
     COST_CONTROL_LABEL_NAMESPACE,
@@ -12115,6 +12116,18 @@ async def _create_session_from_existing_agent(
                 f"invalid model_override: {exc}",
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
+    else:
+        # Operator override (Harness Status dashboard state file): when
+        # the create names no explicit model, seed the session's
+        # ``model_override`` from the per-agent map so the EXISTING
+        # delivery plumbing (``HARNESS_<H>_MODEL`` spawn env / native
+        # ``--model`` argv) applies it. Keyed by the effective agent
+        # name — the dispatched sub-agent's name when set (the bound
+        # ``agent_id`` is the PARENT's), else the agent's own. Read
+        # fresh per create so a dashboard Save affects the next session
+        # without a restart; file/key problems fall back to the pinned
+        # model silently and an invalid value warns (never raises).
+        model_override = resolve_agent_model_override(body.sub_agent_name or agent.name)
 
     # Persisted effort reaches a native CLI as a ``--effort`` argv element
     # at terminal launch (and SDK harnesses via the spawn env). Validate
@@ -12524,6 +12537,22 @@ def _persist_stored_session_bundle(
             agent_bundle_location,
         )
         raise
+
+    # Operator override (Harness Status dashboard state file): the
+    # multipart/bundled create carries no ``model_override`` field, so
+    # seed the session's override from the per-agent map here — the
+    # same choke-point the JSON create path applies after its explicit
+    # override validation. ``create_session_with_agent`` has no
+    # override param, so reuse the PATCH path's store write, mirroring
+    # ``_create_session_from_existing_agent``. Best-effort by design:
+    # the resolver never raises (file problems → pinned model, invalid
+    # value → warning + pinned model).
+    seeded_override = resolve_agent_model_override(agent_name)
+    if seeded_override is not None:
+        conversation_store.update_conversation(
+            created.conversation.id,
+            model_override=seeded_override,
+        )
 
     # The create request has no conv id in its URL; stamp the minted id so
     # the create span joins the session's session.id group.
