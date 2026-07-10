@@ -20,7 +20,15 @@ def test_system_messages_extracted() -> None:
         {"role": "user", "content": "Hi"},
     ]
     payload = _chat_to_anthropic(messages, "claude-test", None, {})
-    assert payload["system"] == "Be helpful."
+    # System is a single-block content list carrying a cache_control
+    # breakpoint (see the cache_control tests below), not a bare string.
+    assert payload["system"] == [
+        {
+            "type": "text",
+            "text": "Be helpful.",
+            "cache_control": {"type": "ephemeral"},
+        }
+    ]
     assert len(payload["messages"]) == 1
     assert payload["messages"][0]["role"] == "user"
 
@@ -32,7 +40,7 @@ def test_multiple_system_messages_joined() -> None:
         {"role": "user", "content": "Hi"},
     ]
     payload = _chat_to_anthropic(messages, "claude-test", None, {})
-    assert payload["system"] == "Be helpful.\nBe concise."
+    assert payload["system"][0]["text"] == "Be helpful.\nBe concise."
 
 
 def test_assistant_tool_calls_converted() -> None:
@@ -555,3 +563,110 @@ def test_max_completion_tokens_alias() -> None:
     messages = [{"role": "user", "content": "Hi"}]
     payload = _chat_to_anthropic(messages, "claude-test", None, {"max_completion_tokens": 2048})
     assert payload["max_tokens"] == 2048
+
+
+# ── Prompt caching ────────────────────────────────────────
+
+
+def test_tools_get_cache_control_when_no_system_prompt() -> None:
+    """
+    With no system message, the last tool definition anchors the
+    cache breakpoint instead (tools render before system/messages).
+    """
+    messages = [{"role": "user", "content": "Hi"}]
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": "get_weather", "parameters": {"type": "object"}},
+        },
+        {
+            "type": "function",
+            "function": {"name": "get_time", "parameters": {"type": "object"}},
+        },
+    ]
+    payload = _chat_to_anthropic(messages, "claude-test", tools, {})
+    assert "system" not in payload
+    assert "cache_control" not in payload["tools"][0]
+    assert payload["tools"][-1]["cache_control"] == {"type": "ephemeral"}
+
+
+def test_no_cache_control_without_system_or_tools() -> None:
+    """Nothing to anchor a breakpoint on -> no cache_control anywhere."""
+    messages = [{"role": "user", "content": "Hi"}]
+    payload = _chat_to_anthropic(messages, "claude-test", None, {})
+    assert "system" not in payload
+    assert "tools" not in payload
+
+
+def test_anthropic_response_usage_includes_cache_tokens() -> None:
+    """
+    ``prompt_tokens`` is the *full* prompt size (input + cache
+    creation + cache read) — Anthropic's own ``input_tokens`` is only
+    the uncached remainder, so summing all three avoids silently
+    under-reporting the prompt.
+    """
+    resp = {
+        "id": "msg_1",
+        "model": "claude-test",
+        "content": [{"type": "text", "text": "Hi"}],
+        "stop_reason": "end_turn",
+        "usage": {
+            "input_tokens": 10,
+            "output_tokens": 5,
+            "cache_creation_input_tokens": 100,
+            "cache_read_input_tokens": 400,
+        },
+    }
+    chat = _anthropic_to_chat(resp)
+    usage = chat["usage"]
+    assert usage["prompt_tokens"] == 510
+    assert usage["total_tokens"] == 515
+    assert usage["cache_creation_input_tokens"] == 100
+    assert usage["cache_read_input_tokens"] == 400
+
+
+def test_anthropic_response_usage_without_cache_fields() -> None:
+    """No cache activity -> cache fields default to zero, not missing."""
+    resp = {
+        "id": "msg_2",
+        "model": "claude-test",
+        "content": [{"type": "text", "text": "Hi"}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 10, "output_tokens": 5},
+    }
+    chat = _anthropic_to_chat(resp)
+    usage = chat["usage"]
+    assert usage["prompt_tokens"] == 10
+    assert usage["cache_creation_input_tokens"] == 0
+    assert usage["cache_read_input_tokens"] == 0
+
+
+@pytest.mark.asyncio
+async def test_stream_usage_includes_cache_tokens() -> None:
+    """Streaming's final usage chunk sums cache tokens into prompt_tokens too."""
+    from omnigent.llms.adapters.anthropic import _stream_to_chat_chunks
+
+    lines = [
+        "data: "
+        + '{"type": "message_start", "message": {"id": "msg_4",'
+        + ' "model": "claude-test",'
+        + ' "usage": {"input_tokens": 10,'
+        + ' "cache_creation_input_tokens": 0,'
+        + ' "cache_read_input_tokens": 200}}}',
+        'data: {"type": "content_block_start", "content_block": {"type": "text"}}',
+        'data: {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "Hi"}}',
+        "data: "
+        + '{"type": "message_delta",'
+        + ' "delta": {"stop_reason": "end_turn"},'
+        + ' "usage": {"output_tokens": 5}}',
+    ]
+
+    async def _aiter():
+        for line in lines:
+            yield line
+
+    chunks = [c async for c in _stream_to_chat_chunks(_aiter())]
+    final = chunks[-1]
+    assert final["usage"]["prompt_tokens"] == 210
+    assert final["usage"]["cache_read_input_tokens"] == 200
+    assert final["usage"]["total_tokens"] == 215

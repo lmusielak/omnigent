@@ -145,6 +145,8 @@ def notify_from_dict(
         input_tokens=int(usage.get("input_tokens") or 0),
         output_tokens=int(usage.get("output_tokens") or 0),
         total_tokens=int(usage.get("total_tokens") or 0),
+        cache_creation_input_tokens=int(usage.get("cache_creation_input_tokens") or 0),
+        cache_read_input_tokens=int(usage.get("cache_read_input_tokens") or 0),
     )
 
 
@@ -154,13 +156,34 @@ def notify(
     input_tokens: int,
     output_tokens: int,
     total_tokens: int,
+    cache_creation_input_tokens: int = 0,
+    cache_read_input_tokens: int = 0,
 ) -> None:
     """Dispatch usage to observers and (if enabled) the auto-recorder.
 
+    ``cache_creation_input_tokens``/``cache_read_input_tokens`` flow into
+    the auto-recorder only — the :class:`UsageObserver` callback contract
+    is unchanged (still exactly ``model``/``input_tokens``/
+    ``output_tokens``/``total_tokens``) so existing fixed-signature
+    observers keep working unmodified.
+
     Never raises: a misbehaving observer is logged and skipped.
     """
-    if _ENV_VAR in os.environ and (input_tokens or output_tokens or total_tokens):
-        _record(model, input_tokens, output_tokens, total_tokens)
+    if _ENV_VAR in os.environ and (
+        input_tokens
+        or output_tokens
+        or total_tokens
+        or cache_creation_input_tokens
+        or cache_read_input_tokens
+    ):
+        _record(
+            model,
+            input_tokens,
+            output_tokens,
+            total_tokens,
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
+        )
         _write_records()
     for cb in list(_OBSERVERS):
         try:
@@ -217,7 +240,14 @@ def _current_test_from_sidecar() -> str | None:
     return text or None
 
 
-def _record(model: str | None, input_tokens: int, output_tokens: int, total_tokens: int) -> None:
+def _record(
+    model: str | None,
+    input_tokens: int,
+    output_tokens: int,
+    total_tokens: int,
+    cache_creation_input_tokens: int = 0,
+    cache_read_input_tokens: int = 0,
+) -> None:
     """Accumulate one usage notification into the current test's bucket.
 
     In the pytest process ``_CURRENT_NODEID`` wins; subprocesses
@@ -232,6 +262,8 @@ def _record(model: str | None, input_tokens: int, output_tokens: int, total_toke
                 "input_tokens": 0,
                 "output_tokens": 0,
                 "total_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
                 "calls": 0,
                 "models": [],
                 "by_model": {},
@@ -240,17 +272,28 @@ def _record(model: str | None, input_tokens: int, output_tokens: int, total_toke
         bucket["input_tokens"] += input_tokens
         bucket["output_tokens"] += output_tokens
         bucket["total_tokens"] += total_tokens
+        bucket["cache_creation_input_tokens"] += cache_creation_input_tokens
+        bucket["cache_read_input_tokens"] += cache_read_input_tokens
         bucket["calls"] += 1
         if model and model not in bucket["models"]:
             bucket["models"].append(model)
         # Per-model breakdown for the aggregator's calls-per-model tally.
         per_model = bucket["by_model"].setdefault(
             model or "<unknown>",
-            {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "calls": 0},
+            {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "calls": 0,
+            },
         )
         per_model["input_tokens"] += input_tokens
         per_model["output_tokens"] += output_tokens
         per_model["total_tokens"] += total_tokens
+        per_model["cache_creation_input_tokens"] += cache_creation_input_tokens
+        per_model["cache_read_input_tokens"] += cache_read_input_tokens
         per_model["calls"] += 1
 
 
@@ -283,17 +326,33 @@ def _write_records() -> None:
     with _RECORDS_LOCK:
         if path is None or not _RECORDS:
             return
-        totals = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "calls": 0}
+        totals = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "calls": 0,
+        }
         totals_by_model: dict[str, dict[str, int]] = {}
         for bucket in _RECORDS.values():
             totals["input_tokens"] += bucket["input_tokens"]
             totals["output_tokens"] += bucket["output_tokens"]
             totals["total_tokens"] += bucket["total_tokens"]
+            totals["cache_creation_input_tokens"] += bucket["cache_creation_input_tokens"]
+            totals["cache_read_input_tokens"] += bucket["cache_read_input_tokens"]
             totals["calls"] += bucket["calls"]
             for model, per_model in bucket.get("by_model", {}).items():
                 model_totals = totals_by_model.setdefault(
                     model,
-                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "calls": 0},
+                    {
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "total_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 0,
+                        "calls": 0,
+                    },
                 )
                 for k in model_totals:
                     model_totals[k] += per_model[k]

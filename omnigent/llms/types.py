@@ -103,14 +103,25 @@ class Usage:
     """
     Token usage information.
 
-    :param input_tokens: Number of input/prompt tokens.
+    :param input_tokens: Number of input/prompt tokens. For providers
+        that support prompt caching, this is the full prompt size —
+        it already includes any ``cache_creation_input_tokens`` /
+        ``cache_read_input_tokens`` for that turn.
     :param output_tokens: Number of output/completion tokens.
     :param total_tokens: Total tokens (input + output).
+    :param cache_creation_input_tokens: Tokens written to the
+        provider's prompt cache this turn, or ``None`` when the
+        provider doesn't report cache usage.
+    :param cache_read_input_tokens: Tokens served from the
+        provider's prompt cache this turn, or ``None`` when the
+        provider doesn't report cache usage.
     """
 
     input_tokens: int | None = None
     output_tokens: int | None = None
     total_tokens: int | None = None
+    cache_creation_input_tokens: int | None = None
+    cache_read_input_tokens: int | None = None
 
 
 @dataclass

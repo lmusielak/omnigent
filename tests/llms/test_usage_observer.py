@@ -65,12 +65,16 @@ def test_notify_records_under_current_test(
         "input_tokens": 10,
         "output_tokens": 5,
         "total_tokens": 15,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
         "calls": 1,
     }
     assert a["by_model"]["m2"] == {
         "input_tokens": 20,
         "output_tokens": 7,
         "total_tokens": 27,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
         "calls": 1,
     }
 
@@ -180,6 +184,8 @@ def test_notify_writes_file_through_without_exit_hooks(
         "input_tokens": 13,
         "output_tokens": 6,
         "total_tokens": 19,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
         "calls": 2,
     }
     assert set(payload["by_test"]) == {"test_a", "test_b"}
@@ -187,7 +193,14 @@ def test_notify_writes_file_through_without_exit_hooks(
     # so its row carries the full file totals. The aggregator reads
     # this key to build the calls-per-model tally.
     assert payload["totals_by_model"] == {
-        "m": {"input_tokens": 13, "output_tokens": 6, "total_tokens": 19, "calls": 2},
+        "m": {
+            "input_tokens": 13,
+            "output_tokens": 6,
+            "total_tokens": 19,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "calls": 2,
+        },
     }
     # No leftover temp file: the atomic write must finish with the
     # os.replace, or the aggregator's tokens*.json glob would pick up
@@ -227,11 +240,37 @@ def test_records_survive_sigkill(tmp_path: Path) -> None:
         "input_tokens": 7,
         "output_tokens": 3,
         "total_tokens": 10,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
         "calls": 1,
     }
     # The child has no in-process nodeid and no sidecar file next to
     # its tokens path, so usage lands in <no-test>.
     assert payload["by_test"]["<no-test>"]["total_tokens"] == 10
+
+
+def test_notify_records_cache_tokens(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """cache_creation/cache_read tokens accumulate into the bucket and totals.
+
+    Anthropic-backed calls report these separately from
+    input_tokens/output_tokens (see llms.adapters.anthropic); the
+    recorder must not drop them on the floor.
+    """
+    monkeypatch.setenv(_usage_observer._ENV_VAR, str(tmp_path / "tokens.json"))
+    _usage_observer.set_current_test("test_a")
+    _usage_observer.notify(
+        model="m",
+        input_tokens=10,
+        output_tokens=5,
+        total_tokens=515,
+        cache_creation_input_tokens=100,
+        cache_read_input_tokens=400,
+    )
+
+    bucket = _usage_observer._RECORDS["test_a"]
+    assert bucket["cache_creation_input_tokens"] == 100
+    assert bucket["cache_read_input_tokens"] == 400
+    assert bucket["by_model"]["m"]["cache_read_input_tokens"] == 400
 
 
 # ── Subprocess attribution via the current-test sidecar ─────────────
