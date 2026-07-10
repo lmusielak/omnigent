@@ -245,7 +245,10 @@ def _extract_usage(usage_dict: dict[str, Any] | None) -> Usage | None:
     Map Chat Completions usage to Responses API usage.
 
     :param usage_dict: Chat Completions usage dict with
-        ``prompt_tokens``, ``completion_tokens``, ``total_tokens``.
+        ``prompt_tokens``, ``completion_tokens``, ``total_tokens``,
+        and (for adapters that support prompt caching, e.g.
+        Anthropic) ``cache_creation_input_tokens`` /
+        ``cache_read_input_tokens``.
     :returns: A :class:`Usage` instance, or ``None``.
     """
     if not usage_dict:
@@ -254,6 +257,8 @@ def _extract_usage(usage_dict: dict[str, Any] | None) -> Usage | None:
         input_tokens=usage_dict.get("prompt_tokens"),
         output_tokens=usage_dict.get("completion_tokens"),
         total_tokens=usage_dict.get("total_tokens"),
+        cache_creation_input_tokens=usage_dict.get("cache_creation_input_tokens"),
+        cache_read_input_tokens=usage_dict.get("cache_read_input_tokens"),
     )
 
 

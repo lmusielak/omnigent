@@ -47,6 +47,8 @@ def _emit_usage_from_response(response: Response) -> None:
         input_tokens=int(usage.input_tokens or 0),
         output_tokens=int(usage.output_tokens or 0),
         total_tokens=int(usage.total_tokens or 0),
+        cache_creation_input_tokens=int(usage.cache_creation_input_tokens or 0),
+        cache_read_input_tokens=int(usage.cache_read_input_tokens or 0),
     )
 
 

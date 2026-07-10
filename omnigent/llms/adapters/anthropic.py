@@ -110,8 +110,6 @@ def _chat_to_anthropic(
 
     # Extract system messages
     system_parts = [m["content"] for m in messages if m["role"] == "system"]
-    if system_parts:
-        payload["system"] = "\n".join(system_parts)
 
     # Convert messages (skip system)
     converted: list[dict[str, Any]] = []
@@ -155,6 +153,28 @@ def _chat_to_anthropic(
     # Tool choice
     if tool_choice := extra.pop("tool_choice", None):
         payload["tool_choice"] = _convert_tool_choice(tool_choice)
+
+    # Prompt caching: Anthropic renders tools -> system -> messages, so a
+    # cache_control breakpoint on the last system block covers tools +
+    # system together. Without a system prompt to anchor it, fall back
+    # to caching the last tool definition. Callers (cost_judge/cost_advisor,
+    # or any repeated-system-prompt agent spec) reuse the same system
+    # prompt and/or tool set across many calls, so this is a pure win —
+    # below the model's minimum cacheable-prefix token count it's a
+    # silent no-op, never an error.
+    if system_parts:
+        payload["system"] = [
+            {
+                "type": "text",
+                "text": "\n".join(system_parts),
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
+    elif payload.get("tools"):
+        payload["tools"][-1] = {
+            **payload["tools"][-1],
+            "cache_control": {"type": "ephemeral"},
+        }
 
     # Reasoning effort (for Claude extended thinking)
     if reasoning_effort := extra.pop("reasoning_effort", None):
@@ -412,6 +432,7 @@ def _anthropic_to_chat(resp: dict[str, Any]) -> dict[str, Any]:
     content = "\n".join(text_parts) if text_parts else None
 
     usage = resp.get("usage", {})
+    prompt_tokens, cache_creation, cache_read = _total_prompt_tokens(usage)
 
     return {
         "id": resp["id"],
@@ -430,13 +451,37 @@ def _anthropic_to_chat(resp: dict[str, Any]) -> dict[str, Any]:
             }
         ],
         "usage": {
-            "prompt_tokens": usage.get("input_tokens"),
+            "prompt_tokens": prompt_tokens,
             "completion_tokens": usage.get("output_tokens"),
-            "total_tokens": (
-                (usage.get("input_tokens") or 0) + (usage.get("output_tokens") or 0) or None
-            ),
+            "total_tokens": ((prompt_tokens or 0) + (usage.get("output_tokens") or 0) or None),
+            "cache_creation_input_tokens": cache_creation,
+            "cache_read_input_tokens": cache_read,
         },
     }
+
+
+def _total_prompt_tokens(usage: dict[str, Any]) -> tuple[int | None, int, int]:
+    """
+    Compute the true total prompt size from an Anthropic usage dict.
+
+    Anthropic's ``input_tokens`` is the *uncached remainder only* —
+    the cached portion of the prompt is billed separately via
+    ``cache_creation_input_tokens`` (cache write) and
+    ``cache_read_input_tokens`` (cache read), and is not included in
+    ``input_tokens``. Summing all three gives the full prompt size a
+    caller expects from ``prompt_tokens``.
+
+    :param usage: Anthropic ``usage`` dict, e.g. ``{"input_tokens": 10,
+        "cache_read_input_tokens": 500}``.
+    :returns: ``(prompt_tokens, cache_creation_input_tokens,
+        cache_read_input_tokens)``. ``prompt_tokens`` is ``None`` when
+        ``input_tokens`` is absent.
+    """
+    input_tokens = usage.get("input_tokens")
+    cache_creation = usage.get("cache_creation_input_tokens") or 0
+    cache_read = usage.get("cache_read_input_tokens") or 0
+    prompt_tokens = None if input_tokens is None else input_tokens + cache_creation + cache_read
+    return prompt_tokens, cache_creation, cache_read
 
 
 # ── Streaming ─────────────────────────────────────────────
@@ -470,6 +515,10 @@ async def _stream_to_chat_chunks(
             metadata["model"] = msg["model"]
             if msg_usage := msg.get("usage"):
                 usage_data["input_tokens"] = msg_usage.get("input_tokens", 0)
+                usage_data["cache_creation_input_tokens"] = msg_usage.get(
+                    "cache_creation_input_tokens", 0
+                )
+                usage_data["cache_read_input_tokens"] = msg_usage.get("cache_read_input_tokens", 0)
             continue
 
         if event_type == "content_block_start":
@@ -519,16 +568,19 @@ async def _stream_to_chat_chunks(
                 usage_data["output_tokens"] = delta_usage.get("output_tokens", 0)
             stop_reason = data.get("delta", {}).get("stop_reason")
             finish = "length" if stop_reason == "max_tokens" else "stop"
+            cache_creation = usage_data.get("cache_creation_input_tokens", 0)
+            cache_read = usage_data.get("cache_read_input_tokens", 0)
+            prompt_tokens = usage_data.get("input_tokens", 0) + cache_creation + cache_read
             yield _make_chunk(
                 metadata,
                 delta={},
                 finish_reason=finish,
                 usage={
-                    "prompt_tokens": usage_data.get("input_tokens"),
+                    "prompt_tokens": prompt_tokens,
                     "completion_tokens": usage_data.get("output_tokens"),
-                    "total_tokens": (
-                        usage_data.get("input_tokens", 0) + usage_data.get("output_tokens", 0)
-                    ),
+                    "total_tokens": prompt_tokens + usage_data.get("output_tokens", 0),
+                    "cache_creation_input_tokens": cache_creation,
+                    "cache_read_input_tokens": cache_read,
                 },
             )
             continue
