@@ -1287,6 +1287,8 @@ class ConversationStore(ABC):
         terminal_launch_args: list[str] | None = None,
         parent_conversation_id: str | None = None,
         runner_id: str | None = None,
+        model_override: str | None = None,
+        harness_override: str | None = None,
     ) -> CreatedSession:
         """
         Atomically create a session and its session-scoped agent.
@@ -1325,6 +1327,14 @@ class ConversationStore(ABC):
         :param runner_id: Optional runner binding to persist at
             creation time, e.g. ``"runner_abc123"``. Child sessions
             inherit the parent's binding through this field.
+        :param model_override: Optional per-session LLM model override,
+            e.g. ``"accounts/fireworks/models/kimi-k3"``. Takes
+            precedence over the bundle's ``executor.model``. ``None``
+            leaves the column NULL (use the bundle's pin).
+        :param harness_override: Optional per-session brain-harness
+            override, e.g. ``"kimi"``. Used instead of the bundle's
+            ``executor.config.harness``. Must already be canonical.
+            ``None`` leaves the column NULL.
         :returns: The committed conversation and agent entities.
         :raises ConversationNotFoundError: If
             ``parent_conversation_id`` is set but no such

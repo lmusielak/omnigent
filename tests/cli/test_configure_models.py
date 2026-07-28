@@ -319,8 +319,8 @@ def test_configure_models_add_gateway_openrouter_chat_wire(isolated_config) -> N
     OpenRouter actually work (the default Responses API 404s on it). Here the
     user serves only the Codex surface.
     """
-    # L1 2=Codex → L2 1=+Add → scoped openai menu 3="Gateway — custom base
-    # URL + key" (order: OpenAI key, ChatGPT sub, Gateway, OpenRouter,
+    # L1 2=Codex → L2 1=+Add → scoped openai menu 4="Gateway — custom base
+    # URL + key" (order: OpenAI key, ChatGPT sub, Fireworks, Gateway, OpenRouter,
     # Databricks, Other) → name; base_url; key; surfaces select 2="Codex /
     # OpenAI only"; wire 2=Chat; default model "qwen/q" → L2 q=back → L1 q=exit.
     stdin = (
@@ -328,7 +328,7 @@ def test_configure_models_add_gateway_openrouter_chat_wire(isolated_config) -> N
             [
                 "2",
                 "1",
-                "3",
+                "4",
                 "openrouter",
                 "https://openrouter.ai/api/v1",
                 "sk-or-test",
@@ -537,12 +537,13 @@ def test_add_menu_options_ordering() -> None:
     Proves the user-requested ordering, in both the full menu and each
     family-scoped subset (the menu actually shown after drilling into a
     harness): the first-party API key(s) and subscription(s) lead, the
-    cross-vendor extras follow alphabetically (Gateway before OpenRouter),
+    cross-vendor extras follow alphabetically (Fireworks, Gateway,
+    OpenRouter),
     and Databricks sits just above the catch-all "Other". A regression to
     the old interleaved order (or Other above Databricks) fails here.
     """
     # Full menu: first-party keys (OpenAI, Anthropic, Gemini), then
-    # subscriptions, then Gateway, OpenRouter, Databricks, Other.
+    # subscriptions, then Fireworks, Gateway, OpenRouter, Databricks, Other.
     full = [o.label.split(None, 1)[1] for o in add_menu_options()]
     assert full == [
         "OpenAI — API key",
@@ -550,6 +551,7 @@ def test_add_menu_options_ordering() -> None:
         "Gemini — API key",
         "ChatGPT — subscription",
         "Claude — subscription (Pro/Max)",
+        "Fireworks AI — API key",
         "Gateway — custom base URL + key",
         "OpenRouter — API key",
         "Databricks — workspace",
@@ -558,12 +560,13 @@ def test_add_menu_options_ordering() -> None:
         "AWS Bedrock — API key",
     ]
 
-    # Codex (openai) scoped: API key, subscription, Gateway, OpenRouter,
-    # Databricks, Other — Databricks immediately above Other.
+    # Codex (openai) scoped: API key, subscription, Fireworks, Gateway,
+    # OpenRouter, Databricks, Other — Databricks immediately above Other.
     codex = [o.label.split(None, 1)[1] for o in add_menu_options_for_family(OPENAI_FAMILY)]
     assert codex == [
         "OpenAI — API key",
         "ChatGPT — subscription",
+        "Fireworks AI — API key",
         "Gateway — custom base URL + key",
         "OpenRouter — API key",
         "Databricks — workspace",
@@ -1158,11 +1161,11 @@ def test_configure_models_add_other_provider_prompts_for_name(
     # env var so detection doesn't add a "use the detected key?" prompt.
     monkeypatch.delenv("XAI_API_KEY", raising=False)
     # "Other" is openai-family, so it lives in the Codex add menu. L1 2=Codex
-    # → L2 1=+Add → openai menu 6="Other provider — API key" (order: OpenAI
-    # key, ChatGPT sub, Gateway, OpenRouter, Databricks, Other) → which
-    # provider → xAI(1) → NAME "my-xai" → key → default model blank → L2
+    # → L2 1=+Add → openai menu 7="Other provider — API key" (order: OpenAI
+    # key, ChatGPT sub, Fireworks, Gateway, OpenRouter, Databricks, Other) →
+    # which provider → xAI(1) → NAME "my-xai" → key → default model blank → L2
     # q=back → L1 q=exit.
-    stdin = "\n".join(["2", "1", "6", "1", "my-xai", "sk-xai-test", "", "q", "q"]) + "\n"
+    stdin = "\n".join(["2", "1", "7", "1", "my-xai", "sk-xai-test", "", "q", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
     assert result.exit_code == 0, result.output
 
@@ -1256,10 +1259,10 @@ def test_configure_models_add_openrouter_key_uses_vendor_endpoint_and_chat_wire(
     """
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     # OpenRouter key is openai-family → Codex add menu. L1 2=Codex → L2
-    # 1=+Add → openai menu 4="OpenRouter — API key" (order: OpenAI key,
+    # 1=+Add → openai menu 5="OpenRouter — API key" (order: OpenAI key,
     # ChatGPT sub, Gateway, OpenRouter, Databricks, Other) → key → default
     # model blank → L2 q=back → L1 q=exit.
-    stdin = "\n".join(["2", "1", "4", "sk-or-test", "", "q", "q"]) + "\n"
+    stdin = "\n".join(["2", "1", "5", "sk-or-test", "", "q", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
     assert result.exit_code == 0, result.output
 

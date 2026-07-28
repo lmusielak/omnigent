@@ -119,3 +119,67 @@ def test_infer_harness_from_model(model: str, expected_harness: str) -> None:
         f"got {infer_harness_from_model(model)!r}. "
         "Check _HARNESS_FOR_MODEL_PREFIX in omnigent/llms/routing.py."
     )
+
+
+# ── Fireworks ────────────────────────────────────────────────────────────────
+def test_fireworks_provider_is_routable() -> None:
+    """Both spellings resolve to the OpenAI-compatible Fireworks endpoint."""
+    from omnigent.llms.routing import PROVIDER_CONFIGS
+
+    for spelling in ("fireworks", "fireworks_ai"):
+        assert PROVIDER_CONFIGS[spelling] == "https://api.fireworks.ai/inference/v1"
+
+
+def test_fireworks_bare_resource_path_parses_whole() -> None:
+    """A bare Fireworks id keeps its full path, which is what its API wants.
+
+    Splitting on the first "/" would read "accounts" as the provider and drop
+    the rest — the id would reach the API mangled.
+    """
+    routed = parse_model_string("accounts/fireworks/models/kimi-k3")
+    assert routed.provider == "fireworks_ai"
+    assert routed.model == "accounts/fireworks/models/kimi-k3"
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "fireworks/accounts/fireworks/models/kimi-k3",
+        "fireworks_ai/accounts/fireworks/models/kimi-k3",
+    ],
+)
+def test_fireworks_prefixed_resource_path_keeps_full_id(model: str) -> None:
+    """An explicit provider prefix does not truncate the resource path."""
+    routed = parse_model_string(model)
+    assert routed.provider == "fireworks_ai"
+    assert routed.model == "accounts/fireworks/models/kimi-k3"
+
+
+def test_fireworks_short_model_name_still_routes() -> None:
+    """The shorthand a spec is likely to carry works too."""
+    routed = parse_model_string("fireworks/kimi-k3")
+    assert routed.provider == "fireworks"
+    assert routed.model == "kimi-k3"
+
+
+def test_accounts_prefix_without_models_marker_is_not_fireworks() -> None:
+    """The special case is narrow: it needs the /models/ marker to apply."""
+    with pytest.raises(OmnigentError):
+        parse_model_string("accounts/something-else")
+
+
+def test_multi_slash_non_fireworks_model_unchanged() -> None:
+    """OpenRouter's vendor/model ids keep their existing split behaviour."""
+    routed = parse_model_string("openrouter/moonshotai/kimi-k2.6")
+    assert routed.provider == "openrouter"
+    assert routed.model == "moonshotai/kimi-k2.6"
+
+
+def test_fireworks_models_infer_the_openai_agents_harness() -> None:
+    """Fireworks serves over the OpenAI-compatible wire → multi-model harness."""
+    for model in (
+        "accounts/fireworks/models/kimi-k3",
+        "fireworks/kimi-k3",
+        "fireworks_ai/kimi-k3",
+    ):
+        assert infer_harness_from_model(model) == "openai-agents"

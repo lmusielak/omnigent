@@ -390,7 +390,13 @@ class AddOption:
 # surface, a distinct family), so it must be excluded here too — otherwise it
 # leaks into the openai-family "Other provider" catch-all, whose tail is
 # documented as "all openai-family" (see :func:`_add_option_families`).
-_PRESET_KEY_PROVIDERS: tuple[str, ...] = ("openai", "anthropic", "openrouter", "gemini")
+_PRESET_KEY_PROVIDERS: tuple[str, ...] = (
+    "openai",
+    "anthropic",
+    "openrouter",
+    "gemini",
+    "fireworks_ai",
+)
 
 
 def add_menu_options() -> list[AddOption]:
@@ -457,7 +463,14 @@ def add_menu_options() -> list[AddOption]:
             SUBSCRIPTION_KIND,
             cli="claude",
         ),
-        # Cross-vendor extras, alphabetical (Gateway before OpenRouter).
+        # Cross-vendor extras, alphabetical (Fireworks, Gateway, OpenRouter).
+        _opt(
+            "Fireworks AI — API key",
+            "Use a Fireworks API key (fireworks.ai) for open-weight frontier "
+            "models such as Kimi K3.",
+            KEY_KIND,
+            provider="fireworks_ai",
+        ),
         _opt(
             "Gateway — custom base URL + key",
             "An OpenAI/Anthropic-compatible proxy: LiteLLM, Ollama, vLLM, …",
@@ -485,7 +498,7 @@ def add_menu_options() -> list[AddOption]:
         ),
         _opt(
             "Other provider — API key",
-            "Groq, DeepSeek, xAI, Mistral, Together AI, Fireworks, …",
+            "Groq, DeepSeek, xAI, Mistral, Together AI, …",
             KEY_KIND,
             other=True,
         ),

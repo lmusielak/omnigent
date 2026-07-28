@@ -255,3 +255,80 @@ async def test_runner_body_omits_harness_override_when_unset(
     assert event.status_code == 202, event.text
     assert captured.get("body") is not None
     assert "harness_override" not in captured["body"]
+
+
+# ── multipart create path ────────────────────────────────────────────────────
+# The JSON create path binds a stored agent row; the multipart path uploads the
+# bundle that IS the agent. Harness-status launches bundles that way, so the
+# overrides have to be expressible there too — the metadata part forbids extra
+# keys, so before this they were a 422, not a silent no-op.
+
+
+async def _create_from_bundle(client: httpx.AsyncClient, **overrides: Any) -> httpx.Response:
+    """Multipart ``POST /v1/sessions`` with *overrides* in the metadata part."""
+    import json as _json
+
+    from tests.server.helpers import build_agent_bundle
+
+    bundle = build_agent_bundle("bundle-agent")
+    return await client.post(
+        "/v1/sessions",
+        data={"metadata": _json.dumps(overrides)},
+        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
+    )
+
+
+async def test_bundle_create_persists_harness_and_model_override(
+    client: httpx.AsyncClient,
+) -> None:
+    """Both overrides survive the multipart path and reach the snapshot."""
+    resp = await _create_from_bundle(client, harness_override="pi", model_override="z-ai/glm-5.2")
+    assert resp.status_code == 201, resp.text
+    sid = resp.json()["session_id"]
+
+    get = await client.get(f"/v1/sessions/{sid}")
+    assert get.status_code == 200, get.text
+    body = get.json()
+    assert body.get("harness") == "pi", (
+        f"harness is {body.get('harness')!r}, expected 'pi' — the multipart "
+        f"metadata override did not reach the agent-configuration row."
+    )
+    assert body.get("model_override") == "z-ai/glm-5.2", (
+        f"model_override is {body.get('model_override')!r} — the multipart "
+        f"metadata override did not persist."
+    )
+
+
+async def test_bundle_create_without_overrides_tracks_the_bundle(
+    client: httpx.AsyncClient,
+) -> None:
+    """NULL-means-track-the-bundle still holds on the multipart path."""
+    resp = await _create_from_bundle(client)
+    assert resp.status_code == 201, resp.text
+    get = await client.get(f"/v1/sessions/{resp.json()['session_id']}")
+    assert get.json().get("harness") == "claude-sdk"
+    assert get.json().get("model_override") is None
+
+
+async def test_bundle_create_canonicalizes_harness_alias(
+    client: httpx.AsyncClient,
+) -> None:
+    """An alias in the metadata part is stored canonical, as on the JSON path."""
+    resp = await _create_from_bundle(client, harness_override="openai-agents-sdk")
+    assert resp.status_code == 201, resp.text
+    get = await client.get(f"/v1/sessions/{resp.json()['session_id']}")
+    assert get.json().get("harness") == "openai-agents"
+
+
+async def test_bundle_create_rejects_bad_overrides(
+    client: httpx.AsyncClient,
+) -> None:
+    """Malformed overrides fail loud rather than persisting unroutable values."""
+    bad = await _create_from_bundle(client, harness_override="not-a-harness")
+    assert bad.status_code == 400, bad.text
+    assert "harness_override" in bad.text
+
+    # flag-shaped model: this string would become a `--model` argv element
+    bad = await _create_from_bundle(client, model_override="--dangerously-skip")
+    assert bad.status_code == 400, bad.text
+    assert "model_override" in bad.text

@@ -1428,6 +1428,22 @@ class SessionCreateMetadata(BaseModel):
         inherits the parent's runner binding for co-location. The
         caller must have READ access to the parent. ``None``
         creates a top-level session.
+    :param model_override: Optional per-session LLM model override to
+        persist at create time, e.g. ``"accounts/fireworks/models/kimi-k3"``.
+        Takes precedence over the uploaded bundle's ``executor.model``.
+        Validated server-side against the shared model-id charset.
+        ``None`` (the default) uses the bundle's pin. Mirrors the JSON
+        create path (:class:`SessionCreateRequest`).
+    :param harness_override: Optional per-session brain-harness override
+        to persist at create time, e.g. ``"pi"`` or ``"kimi"``. The runner
+        uses it instead of the uploaded bundle's
+        ``executor.config.harness``. Validated server-side: must
+        canonicalize into ``OMNIGENT_HARNESSES``, and the uploaded bundle
+        must declare ``executor.type: omnigent`` (other executor types have
+        no ``config.harness``, so an override there would be a silent
+        no-op). Create-time only — the harness process spawns on the first
+        turn, so there is no PATCH path. ``None`` (the default) uses the
+        bundle's declared harness.
     """
 
     title: str | None = None
@@ -1437,6 +1453,8 @@ class SessionCreateMetadata(BaseModel):
     workspace: str | None = None
     terminal_launch_args: list[str] | None = None
     parent_session_id: str | None = None
+    model_override: str | None = None
+    harness_override: str | None = None
 
     model_config = ConfigDict(extra="forbid")
 

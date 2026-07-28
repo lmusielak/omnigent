@@ -430,6 +430,10 @@ _DEFAULT_MODEL_OVERRIDE: dict[str, str] = {
     # xAI — pin the flagship so click.prompt(default=...) always has a value
     # even when the catalog fetch is disabled (e.g. in tests).
     "xai": "grok-3",
+    # Fireworks — Kimi K3, the flagship open-weight model it serves. Fireworks
+    # ids are fully qualified, and the bundled catalog lags new releases, so
+    # pin it explicitly rather than relying on the catalog.
+    "fireworks_ai": "accounts/fireworks/models/kimi-k3",
 }
 
 

@@ -2982,6 +2982,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         terminal_launch_args: list[str] | None = None,
         parent_conversation_id: str | None = None,
         runner_id: str | None = None,
+        model_override: str | None = None,
+        harness_override: str | None = None,
     ) -> CreatedSession:
         """
         Atomically insert a conversation row and session-scoped agent.
@@ -3030,6 +3032,12 @@ class SqlAlchemyConversationStore(ConversationStore):
             creation time, e.g. ``"runner_abc123"``. Child sessions
             inherit the parent's binding through this field so
             runner dispatch remains explicit in store state.
+        :param model_override: Optional per-session LLM model override
+            to write on the agent-configuration row. ``None`` leaves
+            the column NULL.
+        :param harness_override: Optional canonical per-session
+            brain-harness override to write on the agent-configuration
+            row. ``None`` leaves the column NULL.
         :returns: A :class:`CreatedSession` with both entities.
         :raises ConversationNotFoundError: If
             ``parent_conversation_id`` is set but no such
@@ -3065,6 +3073,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             conversation_id,
             agent_id=agent_id,
             reasoning_effort=reasoning_effort,
+            model_override=model_override,
+            harness_override=harness_override,
         )
         with self._conv_session() as ap_sess:
             ap_sess.add(conversation_row)

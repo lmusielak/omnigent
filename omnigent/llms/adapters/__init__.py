@@ -57,6 +57,9 @@ def _create_adapter(provider: str, **kwargs: Any) -> BaseAdapter:
         "openrouter": "https://openrouter.ai/api/v1",
         "ollama": "http://localhost:11434/v1",
         "moonshot": "https://api.moonshot.cn/v1",
+        # Both spellings, matching PROVIDER_CONFIGS in llms/routing.py.
+        "fireworks_ai": "https://api.fireworks.ai/inference/v1",
+        "fireworks": "https://api.fireworks.ai/inference/v1",
     }
 
     if provider in openai_compat_providers:

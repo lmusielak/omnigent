@@ -3106,6 +3106,75 @@ def _validated_harness_override(value: str | None, agent: Agent) -> str | None:
     return canonical
 
 
+def _validated_bundle_model_override(value: str | None) -> str | None:
+    """
+    Validate a multipart session-create ``model_override``.
+
+    The value crosses a spawn boundary — native CLIs receive it as a
+    ``--model`` argv element and the SDK harnesses as ``HARNESS_<H>_MODEL``
+    in the spawn env — so it is held to the shared model-id charset before
+    it is persisted.
+
+    :param value: Raw override from the metadata part, e.g.
+        ``"accounts/fireworks/models/kimi-k3"``. ``None`` means no override.
+    :returns: The stripped model id, or ``None`` when *value* is.
+    :raises OmnigentError: ``invalid_input`` when the id is malformed.
+    """
+    if value is None:
+        return None
+    from omnigent.model_override import validate_model_override
+
+    try:
+        return validate_model_override(value)
+    except ValueError as exc:
+        raise OmnigentError(
+            f"invalid model_override: {exc}",
+            code=ErrorCode.INVALID_INPUT,
+        ) from exc
+
+
+def _validated_bundle_harness_override(value: str | None, spec: Any) -> str | None:
+    """
+    Validate + canonicalize a multipart session-create ``harness_override``.
+
+    Same rules as :func:`_validated_harness_override`, but the authority is
+    the spec parsed from the uploaded bundle rather than a stored agent row:
+    on this path the bundle IS the agent, and it is already in hand, so no
+    load can fail or disagree.
+
+    :param value: Raw override from the metadata part, e.g. ``"kimi"`` or the
+        ``"openai-agents-sdk"`` alias. ``None`` means no override.
+    :param spec: The validated spec from the uploaded bundle.
+    :returns: The canonical harness id, or ``None`` when *value* is.
+    :raises OmnigentError: ``invalid_input`` for an unknown harness or a
+        non-omnigent executor type.
+    """
+    if value is None:
+        return None
+    from omnigent.harness_aliases import canonicalize_harness
+    from omnigent.spec._omnigent_compat import (
+        OMNIGENT_EXECUTOR_TYPE,
+        OMNIGENT_HARNESSES,
+    )
+
+    canonical = canonicalize_harness(value) or value
+    if canonical not in OMNIGENT_HARNESSES:
+        raise OmnigentError(
+            f"invalid harness_override: must be one of "
+            f"{sorted(OMNIGENT_HARNESSES)}, got {value!r}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    executor_type = spec.executor.type
+    if executor_type != OMNIGENT_EXECUTOR_TYPE:
+        raise OmnigentError(
+            f"harness_override only applies to executor.type "
+            f"{OMNIGENT_EXECUTOR_TYPE!r} agents; uploaded bundle "
+            f"{spec.name!r} declares executor.type {executor_type!r}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    return canonical
+
+
 def _utc_day(epoch_seconds: int) -> str:
     """
     Convert a Unix epoch timestamp to its UTC calendar day.
@@ -13349,6 +13418,12 @@ def _create_session_from_bundle(
     )
     assert spec.name is not None
 
+    # Validate the create-time overrides against the bundle just parsed. The
+    # JSON path validates the harness against a stored agent row; here the
+    # uploaded spec is already in hand, so it is the authority.
+    model_override = _validated_bundle_model_override(metadata.model_override)
+    harness_override = _validated_bundle_harness_override(metadata.harness_override, spec)
+
     agent_id = generate_agent_id()
     agent_bundle_location = bundle_location(agent_id, bundle_bytes)
     try:
@@ -13368,6 +13443,8 @@ def _create_session_from_bundle(
         agent_bundle_location=agent_bundle_location,
         agent_description=spec.description,
         runner_id=runner_id,
+        model_override=model_override,
+        harness_override=harness_override,
     )
 
 
@@ -13381,6 +13458,8 @@ def _persist_stored_session_bundle(
     agent_bundle_location: str,
     agent_description: str | None,
     runner_id: str | None = None,
+    model_override: str | None = None,
+    harness_override: str | None = None,
 ) -> CreatedSessionResponse:
     """
     Persist database rows for a bundle already written to artifacts.
@@ -13397,6 +13476,10 @@ def _persist_stored_session_bundle(
     :param agent_description: Optional description from the spec.
     :param runner_id: Optional runner binding inherited from the
         parent session, e.g. ``"runner_abc123"``.
+    :param model_override: Validated per-session model override to
+        persist, or ``None`` to use the bundle's pin.
+    :param harness_override: Validated canonical per-session harness
+        override to persist, or ``None`` to use the bundle's harness.
     :returns: Response with the new session id.
     :raises OmnigentError: If the agent insert violates integrity
         checks or the parent session no longer exists.
@@ -13416,6 +13499,8 @@ def _persist_stored_session_bundle(
             terminal_launch_args=metadata.terminal_launch_args,
             parent_conversation_id=metadata.parent_session_id,
             runner_id=runner_id,
+            model_override=model_override,
+            harness_override=harness_override,
         )
     except ConversationNotFoundError as exc:
         # Parent was authorized by the caller but vanished (deleted)

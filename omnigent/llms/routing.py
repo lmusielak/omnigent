@@ -29,6 +29,12 @@ PROVIDER_CONFIGS: dict[str, str | None] = {
     "openrouter": "https://openrouter.ai/api/v1",
     "ollama": "http://localhost:11434/v1",
     "moonshot": "https://api.moonshot.cn/v1",
+    # Fireworks is OpenAI-compatible. Both spellings route: ``fireworks_ai``
+    # is the catalog/onboarding id (matching FIREWORKS_AI_API_KEY), while
+    # ``fireworks`` is what a model string naturally reads as
+    # ("fireworks/kimi-k3").
+    "fireworks_ai": "https://api.fireworks.ai/inference/v1",
+    "fireworks": "https://api.fireworks.ai/inference/v1",
 }
 
 _DEFAULT_PROVIDER = "openai"
@@ -48,18 +54,34 @@ class RoutedModel:
     model: str
 
 
+# Fireworks ids are fully qualified resource paths
+# ("accounts/fireworks/models/kimi-k3") and its API wants that whole path in
+# the request's ``model`` field. Splitting on the first "/" would read
+# "accounts" as the provider, so the prefix is recognised before the generic
+# split and the id is kept intact.
+_FIREWORKS_MODEL_PATH_PREFIX = "accounts/"
+_FIREWORKS_MODEL_PATH_MARKER = "/models/"
+_FIREWORKS_PROVIDER = "fireworks_ai"
+
+
 def parse_model_string(model: str) -> RoutedModel:
     """
     Parse a ``"provider/model-name"`` string into its components.
 
     If no ``"/"`` is present, the provider defaults to ``"openai"``
-    for backward compatibility.
+    for backward compatibility. A bare Fireworks resource path
+    (``"accounts/<account>/models/<name>"``) is recognised as Fireworks and
+    kept whole, since that full path is the id its API expects.
 
     :param model: The model string, e.g.
-        ``"anthropic/claude-sonnet-4-20250514"`` or ``"gpt-5.4"``.
+        ``"anthropic/claude-sonnet-4-20250514"``, ``"gpt-5.4"``, or
+        ``"accounts/fireworks/models/kimi-k3"``.
     :returns: A :class:`RoutedModel` with ``provider`` and ``model``.
     :raises OmnigentError: If the provider prefix is not recognized.
     """
+    if model.startswith(_FIREWORKS_MODEL_PATH_PREFIX) and (_FIREWORKS_MODEL_PATH_MARKER in model):
+        return RoutedModel(provider=_FIREWORKS_PROVIDER, model=model)
+
     if "/" in model:
         provider, model_name = model.split("/", 1)
     else:
@@ -71,6 +93,13 @@ def parse_model_string(model: str) -> RoutedModel:
             f"Unknown provider {provider!r}. Known providers: {sorted(PROVIDER_CONFIGS)}",
             code=ErrorCode.INVALID_INPUT,
         )
+
+    # A Fireworks model given with an explicit provider prefix still needs its
+    # full resource path sent to the API, so restore what the split removed.
+    if provider in ("fireworks", _FIREWORKS_PROVIDER) and model_name.startswith(
+        _FIREWORKS_MODEL_PATH_PREFIX
+    ):
+        return RoutedModel(provider=_FIREWORKS_PROVIDER, model=model_name)
 
     return RoutedModel(provider=provider, model=model_name)
 
@@ -86,6 +115,13 @@ _HARNESS_FOR_MODEL_PREFIX: dict[str, str] = {
     "gpt-": "openai-agents",
     # xAI is OpenAI-compatible; provider prefix required (bare grok- defaults to openai).
     "xai/grok-": "openai-agents",
+    # Fireworks serves open-weight models over the OpenAI-compatible wire, so
+    # they run on the multi-model openai-agents harness. Its own ids are fully
+    # qualified ("accounts/fireworks/models/kimi-k3"); the provider-prefixed
+    # spellings cover the shorthand a spec is more likely to carry.
+    "accounts/fireworks/models/": "openai-agents",
+    "fireworks_ai/": "openai-agents",
+    "fireworks/": "openai-agents",
 }
 
 
