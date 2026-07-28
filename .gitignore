@@ -1,4 +1,8 @@
-.venv/
+# No trailing slash: a worktree commonly holds `.venv` as a SYMLINK to the main
+# checkout's venv (so repo hooks can find an interpreter), and `.venv/` matches
+# directories only — the symlink would be committed, then break CI's dependency
+# install against a path that does not exist on the runner.
+.venv
 build/
 dist/
 node_modules/
