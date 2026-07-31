@@ -2,6 +2,8 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import type { ServerInfo, SharingMode } from "@/lib/capabilities";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { PermissionsModal } from "./PermissionsModal";
 
 vi.mock("@/lib/permissionsApi", () => ({
@@ -10,10 +12,19 @@ vi.mock("@/lib/permissionsApi", () => ({
   revokePermission: vi.fn(),
 }));
 
+// Stub the QR renderer so tests can assert the encoded deep-link value via a
+// data attribute instead of decoding SVG paths. Renders a bare element with no
+// text content so it can't accidentally match unrelated text-based assertions.
+vi.mock("qrcode.react", () => ({
+  QRCodeSVG: (props: { value: string; "aria-label"?: string }) => (
+    <svg data-testid="share-qr-code" data-value={props.value} aria-label={props["aria-label"]} />
+  ),
+}));
+
 // Host config is read-once at render to decide plain-input vs combobox and to
 // transform the share link. Mock both getters so we can drive each branch.
 vi.mock("@/lib/host", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/lib/host")>();
+  const actual = await importOriginal<typeof host>();
   return {
     ...actual,
     getOmnigentUserSearch: vi.fn(() => undefined),
@@ -23,6 +34,7 @@ vi.mock("@/lib/host", async (importOriginal) => {
 
 import * as api from "@/lib/permissionsApi";
 import * as host from "@/lib/host";
+
 const listMock = vi.mocked(api.listPermissions);
 const grantMock = vi.mocked(api.grantPermission);
 const revokeMock = vi.mocked(api.revokePermission);
@@ -40,6 +52,48 @@ function createWrapper() {
       </QueryClientProvider>
     );
   };
+}
+
+/** Full OSS ServerInfo with permissive defaults; override per test. */
+function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
+  return {
+    accounts_enabled: false,
+    single_user: false,
+    login_url: null,
+    needs_setup: false,
+    databricks_features: false,
+    managed_sandboxes_enabled: false,
+    sandbox_provider: null,
+    sharing_mode: "on",
+    public_sharing_enabled: true,
+    server_version: null,
+    smart_routing_enabled: false,
+    harness_install_enabled: false,
+    installable_harnesses: [],
+    dictation_available: false,
+    ...overrides,
+  };
+}
+
+/** Wrapper that pins arbitrary ServerInfo overrides via CapabilitiesProvider. */
+function createInfoWrapper(overrides: Partial<ServerInfo>) {
+  const qc = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  return function Wrapper({ children }: { children: React.ReactNode }) {
+    return (
+      <QueryClientProvider client={qc}>
+        <TooltipProvider>
+          <CapabilitiesProvider info={serverInfo(overrides)}>{children}</CapabilitiesProvider>
+        </TooltipProvider>
+      </QueryClientProvider>
+    );
+  };
+}
+
+/** Wrapper that pins the server's sharing policy via CapabilitiesProvider. */
+function createSharingWrapper(mode: SharingMode) {
+  return createInfoWrapper({ sharing_mode: mode });
 }
 
 beforeEach(() => {
@@ -88,7 +142,7 @@ describe("PermissionsModal", () => {
     fireEvent.click(grantBtn);
 
     await waitFor(() => {
-      expect(grantMock).toHaveBeenCalledWith("conv_abc", "carol@example.com", 1);
+      expect(grantMock).toHaveBeenCalledWith("conv_abc", "carol@example.com", 1, false);
     });
   });
 
@@ -137,7 +191,7 @@ describe("PermissionsModal", () => {
     fireEvent.click(await screen.findByRole("option", { name: "Edit" }));
 
     await waitFor(() => {
-      expect(grantMock).toHaveBeenCalledWith("conv_abc", "bob@example.com", 2);
+      expect(grantMock).toHaveBeenCalledWith("conv_abc", "bob@example.com", 2, false);
     });
     // Editing the level must never delete the existing grant.
     expect(revokeMock).not.toHaveBeenCalled();
@@ -179,6 +233,43 @@ describe("PermissionsModal", () => {
     await waitFor(() => {
       expect(grantMock).toHaveBeenCalledWith("conv_abc", "__public__", 1);
     });
+  });
+
+  it("lets owners grant edit plus approval authority", async () => {
+    listMock.mockResolvedValue([]);
+    grantMock.mockResolvedValue({
+      user_id: "bob@example.com",
+      conversation_id: "conv_abc",
+      level: 2,
+      can_approve: true,
+    });
+
+    render(
+      <PermissionsModal
+        sessionId="conv_abc"
+        open={true}
+        onOpenChange={() => {}}
+        canDelegateApprovals
+      />,
+      { wrapper: createWrapper() },
+    );
+
+    await waitFor(() => expect(listMock).toHaveBeenCalled());
+    fireEvent.change(screen.getByPlaceholderText("alice@example.com"), {
+      target: { value: "bob@example.com" },
+    });
+    const formSelect = screen.getByRole("combobox");
+    formSelect.focus();
+    fireEvent.keyDown(formSelect, { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "Edit + approve" }));
+    fireEvent.click(screen.getByRole("button", { name: /grant/i }));
+
+    await waitFor(() => {
+      expect(grantMock).toHaveBeenCalledWith("conv_abc", "bob@example.com", 2, true);
+    });
+    expect(
+      screen.getByText("Approvers can authorize actions that use your session credentials."),
+    ).toBeInTheDocument();
   });
 
   it("displays server error messages from failed grant", async () => {
@@ -225,6 +316,8 @@ describe("PermissionsModal", () => {
     // The manage grant's level is still visible to the viewer as static text.
     expect(screen.getByText("Manage")).toBeInTheDocument();
 
+    // Only one listbox can be open, so each interaction must finish first.
+    /* oxlint-disable no-await-in-loop */
     for (const trigger of triggers) {
       trigger.focus();
       fireEvent.keyDown(trigger, { key: "Enter" });
@@ -237,6 +330,7 @@ describe("PermissionsModal", () => {
       fireEvent.keyDown(listbox, { key: "Escape" });
       await waitFor(() => expect(screen.queryByRole("listbox")).not.toBeInTheDocument());
     }
+    /* oxlint-enable no-await-in-loop */
   });
 
   it("does not fetch permissions when closed", () => {
@@ -431,6 +525,189 @@ describe("PermissionsModal", () => {
       fireEvent.change(input, { target: { value: "zzz" } });
 
       await waitFor(() => expect(screen.getByText("No matches")).toBeInTheDocument());
+    });
+  });
+
+  describe("sharing mode", () => {
+    it("off: shows the disabled notice and never fetches grants", async () => {
+      render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
+        wrapper: createSharingWrapper("off"),
+      });
+
+      expect(
+        await screen.findByText("Sharing has been disabled for this Omnigent server."),
+      ).toBeInTheDocument();
+      // Off short-circuits before the grant-list query and hides all controls.
+      expect(listMock).not.toHaveBeenCalled();
+      expect(screen.queryByRole("button", { name: /grant/i })).not.toBeInTheDocument();
+      expect(screen.queryByRole("switch")).not.toBeInTheDocument();
+    });
+
+    it("on: renders the full controls with no disabled/read-only notice", async () => {
+      listMock.mockResolvedValue([]);
+
+      render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
+        wrapper: createSharingWrapper("on"),
+      });
+
+      await waitFor(() => expect(listMock).toHaveBeenCalledWith("conv_abc"));
+      expect(screen.getByRole("button", { name: /grant/i })).toBeInTheDocument();
+      expect(
+        screen.getByText("Invite others to view or collaborate on this session."),
+      ).toBeInTheDocument();
+      expect(
+        screen.queryByText("Sharing has been disabled for this Omnigent server."),
+      ).not.toBeInTheDocument();
+    });
+
+    it("read_only: shows the read-only notice, keeps Grant, offers only Read", async () => {
+      listMock.mockResolvedValue([]);
+
+      render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
+        wrapper: createSharingWrapper("read_only"),
+      });
+
+      await waitFor(() => expect(listMock).toHaveBeenCalledWith("conv_abc"));
+      expect(
+        screen.getByText(
+          "This server allows read-only sharing — invite others to view this session.",
+        ),
+      ).toBeInTheDocument();
+      // Read grants are still allowed, so the Grant control stays.
+      expect(screen.getByRole("button", { name: /grant/i })).toBeInTheDocument();
+      // The add-form level select must offer only Read (Edit is hidden). With no
+      // grants there is exactly one combobox (the add-form select).
+      const trigger = screen.getByRole("combobox");
+      trigger.focus();
+      fireEvent.keyDown(trigger, { key: "Enter" });
+      const listbox = await screen.findByRole("listbox");
+      const options = within(listbox).getAllByRole("option");
+      expect(options.map((o) => o.textContent)).toEqual(["Read"]);
+    });
+
+    it("restricted_read_only: presents the same read-only UI as read_only", async () => {
+      // The per-session home/root block is enforced server-side; the modal
+      // itself shows the read-only affordance for every session.
+      listMock.mockResolvedValue([]);
+
+      render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
+        wrapper: createSharingWrapper("restricted_read_only"),
+      });
+
+      await waitFor(() => expect(listMock).toHaveBeenCalledWith("conv_abc"));
+      expect(
+        screen.getByText(
+          "This server allows read-only sharing — invite others to view this session.",
+        ),
+      ).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: /grant/i })).toBeInTheDocument();
+      const trigger = screen.getByRole("combobox");
+      trigger.focus();
+      fireEvent.keyDown(trigger, { key: "Enter" });
+      const listbox = await screen.findByRole("listbox");
+      const options = within(listbox).getAllByRole("option");
+      expect(options.map((o) => o.textContent)).toEqual(["Read"]);
+    });
+  });
+
+  describe("public access", () => {
+    it("hides the Public access toggle when the server disables public sharing", async () => {
+      listMock.mockResolvedValue([]);
+
+      render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
+        wrapper: createInfoWrapper({ public_sharing_enabled: false }),
+      });
+
+      await waitFor(() => expect(listMock).toHaveBeenCalledWith("conv_abc"));
+      // The user-grant UI stays; only the public toggle is gone.
+      expect(screen.getByRole("button", { name: /grant/i })).toBeInTheDocument();
+      expect(screen.queryByText("Public access")).not.toBeInTheDocument();
+      expect(screen.queryByRole("switch")).not.toBeInTheDocument();
+    });
+
+    it("shows the Public access toggle when public sharing is enabled", async () => {
+      listMock.mockResolvedValue([]);
+
+      render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
+        wrapper: createInfoWrapper({ public_sharing_enabled: true }),
+      });
+
+      await waitFor(() => expect(listMock).toHaveBeenCalledWith("conv_abc"));
+      expect(screen.getByText("Public access")).toBeInTheDocument();
+      expect(screen.getByRole("switch")).toBeInTheDocument();
+    });
+  });
+
+  describe("share QR code", () => {
+    // The QR encodes an `omnigent://<host>/c/<id>` deep link (the same scheme
+    // the desktop shell's deep-link handler parses — see electron/src/deepLink.js).
+    // Pin the host resolution against the standalone origin and the embedded
+    // host transform so the encoded value stays correct in both contexts.
+
+    // jsdom's window.location is a non-configurable property; override it on a
+    // plain object so `getShareableLink`/`getDeepLink` see the test origin. Awaits
+    // the body so re-renders triggered during the test (e.g. the permissions
+    // query resolving) still see the overridden origin before it's restored.
+    async function withLocation(origin: string, fn: () => Promise<void> | void): Promise<void> {
+      const original = window.location;
+      Object.defineProperty(window, "location", {
+        configurable: true,
+        value: { ...original, origin },
+      });
+      try {
+        await fn();
+      } finally {
+        Object.defineProperty(window, "location", { configurable: true, value: original });
+      }
+    }
+
+    it("encodes the omnigent:// deep link for the session from the server origin", async () => {
+      listMock.mockResolvedValue([]);
+
+      await withLocation("https://app.example.com", async () => {
+        render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
+          wrapper: createWrapper(),
+        });
+
+        await waitFor(() => expect(listMock).toHaveBeenCalled());
+        // The QR is hidden until the user clicks "Open in mobile app".
+        expect(screen.queryByTestId("share-qr-code")).not.toBeInTheDocument();
+        fireEvent.click(screen.getByRole("button", { name: /open in mobile app/i }));
+        const qr = await screen.findByTestId("share-qr-code");
+        expect(qr).toHaveAttribute("data-value", "omnigent://app.example.com/c/conv_abc");
+      });
+    });
+
+    it("includes the port in the host when non-default", async () => {
+      // Mirrors the deep-link convention: `omnigent://localhost:8000/c/<id>`.
+      listMock.mockResolvedValue([]);
+
+      await withLocation("http://localhost:8000", async () => {
+        render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
+          wrapper: createWrapper(),
+        });
+
+        await waitFor(() => expect(listMock).toHaveBeenCalled());
+        fireEvent.click(screen.getByRole("button", { name: /open in mobile app/i }));
+        const qr = await screen.findByTestId("share-qr-code");
+        expect(qr).toHaveAttribute("data-value", "omnigent://localhost:8000/c/conv_abc");
+      });
+    });
+
+    it("derives the host from the host transformShareLink in the embed", async () => {
+      // In the embed the host transform returns the full absolute URL; the QR
+      // must take its host from that URL, not window.location.origin.
+      listMock.mockResolvedValue([]);
+      transformLinkMock.mockReturnValue((path: string) => `https://host.example.com/embed#${path}`);
+
+      render(<PermissionsModal sessionId="conv_xyz" open={true} onOpenChange={() => {}} />, {
+        wrapper: createWrapper(),
+      });
+
+      await waitFor(() => expect(listMock).toHaveBeenCalled());
+      fireEvent.click(screen.getByRole("button", { name: /open in mobile app/i }));
+      const qr = await screen.findByTestId("share-qr-code");
+      expect(qr).toHaveAttribute("data-value", "omnigent://host.example.com/c/conv_xyz");
     });
   });
 });

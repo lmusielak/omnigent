@@ -20,7 +20,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Literal
 
 from cachetools import TTLCache
 
@@ -37,7 +37,10 @@ from omnigent.entities.session_resources import (
 )
 
 if TYPE_CHECKING:
+    from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
     from omnigent.inner.os_env import OSEnvironment
+    from omnigent.inner.terminal import TerminalInstance
+    from omnigent.spec.types import AgentSpec
     from omnigent.terminals.registry import TerminalRegistry
 
 _logger = logging.getLogger(__name__)
@@ -172,7 +175,7 @@ def _trim_terminal_exit_output(text: str | None) -> str | None:
 
 
 def _terminal_exit_diagnostics(
-    instance: Any | None,
+    instance: TerminalInstance | None,
 ) -> tuple[str | None, int | None, str | None, str | None]:
     """Extract generic launch/output diagnostics from a terminal instance."""
     if instance is None:
@@ -303,6 +306,11 @@ class SessionResourceRegistry:
         # lifecycle relationship so the runner can decide whether the owning
         # session should fail.
         self._terminal_exit_publisher: Callable[[TerminalExitEvent], None] | None = None
+        # Strong reference to the fire-and-forget terminal-exit cleanup tasks,
+        # plus an event so loop-side callers can await scheduling/completion
+        # instead of polling. Entries self-remove on completion.
+        self._terminal_exit_tasks: set[asyncio.Task[None]] = set()
+        self._terminal_exit_scheduled: asyncio.Event = asyncio.Event()
 
     def set_terminal_activity_publisher(
         self,
@@ -359,6 +367,18 @@ class SessionResourceRegistry:
         :param publisher: Callable receiving a :class:`TerminalExitEvent`.
         """
         self._terminal_exit_publisher = publisher
+
+    async def wait_for_terminal_exit_cleanup(self) -> None:
+        """Await the scheduled terminal-exit cleanup to completion so its
+        ``session.resource.deleted`` publish is observable without polling.
+
+        Single-shot: the "scheduled" event is never cleared, so this
+        synchronizes on one terminal exit, not a sequence of them.
+        """
+        await self._terminal_exit_scheduled.wait()
+        tasks = list(self._terminal_exit_tasks)
+        if tasks:
+            await asyncio.gather(*tasks)
 
     def _set_session_status_memo(self, session_id: str, status: str) -> None:
         """Record the session's latest PTY status for exit classification."""
@@ -430,7 +450,7 @@ class SessionResourceRegistry:
         session_id: str,
         *,
         resource_type: Literal["environment", "terminal", "file"] | None = None,
-        agent_spec: Any | None = None,
+        agent_spec: AgentSpec | None = None,
     ) -> PagedList[SessionResourceView]:
         """List all resources for a session.
 
@@ -533,7 +553,7 @@ class SessionResourceRegistry:
         self,
         session_id: str,
         environment_id: str,
-        agent_spec: Any | None = None,
+        agent_spec: AgentSpec | None = None,
     ) -> OSEnvironment:
         """Resolve an environment id to a live OSEnvironment.
 
@@ -569,7 +589,7 @@ class SessionResourceRegistry:
     def _resolve_primary(
         self,
         session_id: str,
-        agent_spec: Any | None,
+        agent_spec: AgentSpec | None,
     ) -> OSEnvironment:
         """Get or create the primary OSEnvironment for a session.
 
@@ -589,7 +609,7 @@ class SessionResourceRegistry:
     def _create_primary_env(
         self,
         session_id: str,
-        agent_spec: Any | None,
+        agent_spec: AgentSpec | None,
     ) -> OSEnvironment:
         """Create a new primary OSEnvironment.
 
@@ -677,7 +697,7 @@ class SessionResourceRegistry:
     def compute_default_env_root(
         self,
         session_id: str,
-        agent_spec: Any | None,
+        agent_spec: AgentSpec | None,
     ) -> str | None:
         """Compute the resolved filesystem root for the default environment.
 
@@ -743,11 +763,11 @@ class SessionResourceRegistry:
         session_id: str,
         terminal_name: str,
         session_key: str,
-        spec: Any,
+        spec: TerminalEnvSpec,
         *,
         cwd_override: str | None = None,
         sandbox_override: str | None = None,
-        parent_os_env: Any | None = None,
+        parent_os_env: OSEnvSpec | None = None,
         resource_role: str | None = None,
     ) -> SessionResourceView:
         """Launch a terminal required for the owning session to execute.
@@ -776,11 +796,11 @@ class SessionResourceRegistry:
         session_id: str,
         terminal_name: str,
         session_key: str,
-        spec: Any,
+        spec: TerminalEnvSpec,
         *,
         cwd_override: str | None = None,
         sandbox_override: str | None = None,
-        parent_os_env: Any | None = None,
+        parent_os_env: OSEnvSpec | None = None,
         resource_role: str | None = None,
     ) -> SessionResourceView:
         """Launch a terminal resource attached to the owning session.
@@ -811,10 +831,10 @@ class SessionResourceRegistry:
         session_id: str,
         terminal_name: str,
         session_key: str,
-        spec: Any,
+        spec: TerminalEnvSpec,
         cwd_override: str | None = None,
         sandbox_override: str | None = None,
-        parent_os_env: Any | None = None,
+        parent_os_env: OSEnvSpec | None = None,
         resource_role: str | None = None,
     ) -> SessionResourceView:
         """Launch a terminal, then observe it with the requested lifecycle."""
@@ -844,7 +864,7 @@ class SessionResourceRegistry:
         session_id: str,
         terminal_name: str,
         session_key: str,
-        instance: Any,
+        instance: TerminalInstance,
         *,
         resource_role: str | None = None,
     ) -> SessionResourceView:
@@ -867,7 +887,7 @@ class SessionResourceRegistry:
         session_id: str,
         terminal_name: str,
         session_key: str,
-        instance: Any,
+        instance: TerminalInstance,
         *,
         resource_role: str | None = None,
     ) -> SessionResourceView:
@@ -892,7 +912,7 @@ class SessionResourceRegistry:
         session_id: str,
         terminal_name: str,
         session_key: str,
-        instance: Any,
+        instance: TerminalInstance,
         resource_role: str | None = None,
     ) -> SessionResourceView:
         """Project and observe an already-launched terminal instance."""
@@ -940,7 +960,7 @@ class SessionResourceRegistry:
         session_id: str,
         terminal_name: str,
         session_key: str,
-        instance: Any,
+        instance: TerminalInstance,
         resource_role: str | None,
         lifecycle: TerminalLifecycle,
         *,
@@ -1062,6 +1082,9 @@ class SessionResourceRegistry:
                         instance=instance,
                     )
                 )
+                self._terminal_exit_tasks.add(task)
+                self._terminal_exit_scheduled.set()
+                task.add_done_callback(self._terminal_exit_tasks.discard)
                 task.add_done_callback(_log_terminal_exit_task_result)
 
             try:
@@ -1130,7 +1153,7 @@ class SessionResourceRegistry:
         terminal_name: str,
         session_key: str,
         lifecycle: TerminalLifecycle,
-        instance: Any | None = None,
+        instance: TerminalInstance | None = None,
     ) -> None:
         """Clean up and publish lifecycle events for an unexpected terminal exit."""
         terminal_id = terminal_resource_id(terminal_name, session_key)

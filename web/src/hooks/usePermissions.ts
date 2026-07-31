@@ -54,12 +54,20 @@ export function useSessionOwner(sessionId: string | null) {
 export function useGrantPermission(sessionId: string) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ userId, level }: { userId: string; level: number }) =>
-      grantPermission(sessionId, userId, level),
+    mutationFn: ({ userId, level, canApprove }: GrantPermissionInput) =>
+      canApprove === undefined
+        ? grantPermission(sessionId, userId, level)
+        : grantPermission(sessionId, userId, level, canApprove),
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: permissionsKey(sessionId) });
     },
   });
+}
+
+interface GrantPermissionInput {
+  userId: string;
+  level: number;
+  canApprove?: boolean;
 }
 
 /** Revoke a permission. Invalidates the permissions list on success. */
@@ -78,7 +86,7 @@ export function useRevokePermission(sessionId: string) {
  * `null` permission level (single-user mode) is treated as unrestricted.
  */
 export function useCanEdit(conversationId: string): boolean {
-  const { data: conversationsData } = useConversations();
+  const { data: conversationsData } = useConversations("", true);
   const { session: activeSession, isLoading: sessionLoading } = useSession(conversationId);
   return useMemo(() => {
     const conversations = conversationsData?.pages.flatMap((p) => p.data);

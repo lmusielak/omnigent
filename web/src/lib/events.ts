@@ -141,6 +141,13 @@ export interface ToolResult {
   responseId: string;
 }
 
+/** `response.function_call_output.delta` — live output from a running tool. */
+export interface ToolOutputDelta {
+  type: "tool_output_delta";
+  callId: string;
+  delta: string;
+}
+
 /**
  * A server-initiated elicitation, MCP shape.
  *
@@ -280,7 +287,7 @@ export interface NativeToolCall {
 /** The final assistant message from `output_item.done` (type `message`). */
 export interface MessageDone {
   type: "message_done";
-  content: Array<Record<string, unknown>>;
+  content: Record<string, unknown>[];
   itemId: string;
   responseId: string;
 }
@@ -451,6 +458,8 @@ export interface SessionStatusEvent {
   status: "idle" | "launching" | "running" | "waiting" | "failed";
   responseId?: string;
   backgroundTaskCount?: number;
+  /** Structured failure detail; only present when `status === "failed"`. */
+  error?: { code: string; message: string };
 }
 
 /**
@@ -556,11 +565,11 @@ export interface SessionAgentChangedEvent {
 export interface SessionTodosEvent {
   type: "session_todos";
   conversationId: string;
-  todos: Array<{
+  todos: {
     content: string;
     status: "pending" | "in_progress" | "completed";
     activeForm: string;
-  }>;
+  }[];
 }
 
 /**
@@ -778,9 +787,8 @@ export interface SessionSkillsEvent {
 }
 
 /**
- * `session.model_options` — the Codex app-server model catalog just
- * resolved for a session. Consumers refetch the session snapshot and apply
- * its now-populated `codexModelOptions`.
+ * `session.model_options` — a runner-owned native model catalog just resolved.
+ * Consumers refetch the session snapshot and apply its now-populated options.
  */
 export interface SessionModelOptionsEvent {
   type: "session_model_options";
@@ -830,6 +838,22 @@ export interface SessionSupersededEvent {
   reason: "clear";
 }
 
+/**
+ * `browser.action_request` — the agent's `browser_*` tool asks the desktop shell
+ * to run a browser action against this conversation's WebContentsView. Every
+ * renderer sees the event, but the relay (`useBrowserAgentRelay`) claims it first
+ * so only one executes; non-Electron renderers ignore it.
+ */
+export interface BrowserActionRequestEvent {
+  type: "browser_action_request";
+  /** Server-minted id; echoed on claim + result to resolve the parked Future. */
+  actionId: string;
+  /** The bare verb: "navigate" | "snapshot" | "click" | "type" | "screenshot". */
+  action: string;
+  /** Action-specific args (url, ref, selector, text, …); shape validated per-action. */
+  args: Record<string, unknown>;
+}
+
 // ── Union type for all events ────────────────────────────
 
 export type StreamEvent =
@@ -846,6 +870,7 @@ export type StreamEvent =
   | ReasoningSummaryDelta
   | ToolCall
   | ToolResult
+  | ToolOutputDelta
   | NativeToolCall
   | SlashCommand
   | RoutingDecision
@@ -882,4 +907,5 @@ export type StreamEvent =
   | SessionTerminalActivityEvent
   | SessionSkillsEvent
   | SessionModelOptionsEvent
-  | SessionPresenceEvent;
+  | SessionPresenceEvent
+  | BrowserActionRequestEvent;

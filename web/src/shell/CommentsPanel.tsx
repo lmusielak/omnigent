@@ -7,6 +7,7 @@ import { getCurrentAuthorId } from "@/lib/identity";
 import { cn } from "@/lib/utils";
 import type { Comment } from "@/hooks/useComments";
 import type { ActiveSelection } from "./codeViewerHelpers";
+import { displayAnchorContent } from "./pdfCommentHelpers";
 
 function avatarStyle(name: string): { backgroundColor: string; color: string } {
   let hash = 0;
@@ -98,26 +99,27 @@ export function CommentsPanel({
   const currentAuthorId = getCurrentAuthorId();
   const canModify = (c: Comment): boolean =>
     canEdit && (c.created_by == null || c.created_by === currentAuthorId);
+  const activeSelectionStart = activeSelection?.start_index;
+  const activeSelectionEnd = activeSelection?.end_index;
 
   useEffect(() => {
     setBody("");
     if (pendingBodyRef) pendingBodyRef.current = "";
-  }, [activeSelection?.start_index, activeSelection?.end_index]);
+  }, [activeSelectionStart, activeSelectionEnd, pendingBodyRef]);
 
   // Auto-focus the textarea when a new pending selection appears (no existing
   // comment at that range) so the user can start typing immediately.
   useEffect(() => {
-    if (!activeSelection) return;
+    if (activeSelectionStart == null || activeSelectionEnd == null) return;
     const isExisting = comments.some(
-      (c) =>
-        c.start_index === activeSelection.start_index && c.end_index === activeSelection.end_index,
+      (c) => c.start_index === activeSelectionStart && c.end_index === activeSelectionEnd,
     );
     if (!isExisting) {
       // rAF ensures the textarea has been rendered before we try to focus it.
       const id = requestAnimationFrame(() => addCommentTextareaRef.current?.focus());
       return () => cancelAnimationFrame(id);
     }
-  }, [activeSelection?.start_index, activeSelection?.end_index, comments]);
+  }, [activeSelectionStart, activeSelectionEnd, comments]);
 
   // Selecting a highlighted range in the file activates its comment; if that
   // comment lives on the other tab, switch to the tab that holds it so its card
@@ -223,7 +225,7 @@ export function CommentsPanel({
               {activeSelection.anchor_content && (
                 <div className="truncate rounded bg-muted/40 px-2 py-1 font-mono text-[10px] text-muted-foreground">
                   <span className="text-foreground/60">Selection: </span>
-                  {activeSelection.anchor_content.trim().split("\n")[0]}
+                  {displayAnchorContent(activeSelection.anchor_content).split("\n")[0]}
                 </div>
               )}
               <textarea
@@ -409,7 +411,7 @@ function CommentCard({
       {/* Anchor */}
       {c.anchor_content && (
         <p className="truncate font-mono text-[11px] text-muted-foreground">
-          {c.anchor_content.trim()}
+          {displayAnchorContent(c.anchor_content)}
         </p>
       )}
 

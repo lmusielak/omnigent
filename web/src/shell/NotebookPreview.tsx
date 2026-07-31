@@ -1,3 +1,4 @@
+import type { RefObject, UIEvent } from "react";
 import type { BundledLanguage } from "shiki";
 import AnsiDefault from "ansi-to-react";
 import ReactMarkdown from "react-markdown";
@@ -209,7 +210,15 @@ function CodeCell({ cell, language }: { cell: NotebookCell; language: BundledLan
   );
 }
 
-export function NotebookPreview({ content }: { content: string }) {
+export function NotebookPreview({
+  content,
+  rootRef,
+  onScroll,
+}: {
+  content: string;
+  rootRef?: RefObject<HTMLDivElement | null>;
+  onScroll?: (event: UIEvent<HTMLElement>) => void;
+}) {
   const { notebook, error } = parseNotebook(content);
 
   if (error || !notebook) {
@@ -227,7 +236,12 @@ export function NotebookPreview({ content }: { content: string }) {
   const language = langName as BundledLanguage;
 
   return (
-    <div className="h-full space-y-4 overflow-auto px-6 py-4">
+    <div
+      ref={rootRef}
+      data-preview-scroll
+      onScroll={onScroll}
+      className="h-full space-y-4 overflow-auto px-6 py-4"
+    >
       {(notebook.cells ?? []).map((cell, i) => {
         if (cell.cell_type === "markdown") {
           return (

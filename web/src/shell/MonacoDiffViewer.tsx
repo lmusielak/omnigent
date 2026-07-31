@@ -26,6 +26,7 @@ import {
   resolvedThemeToMonaco,
 } from "./monacoSetup";
 import { useMonacoCommentLayer, type CodeEditorInstance } from "./useMonacoCommentLayer";
+import { attachEditorScrollRestore } from "./useScrollRestore";
 import "./monacoCodeEditor.css";
 
 interface MonacoDiffViewerProps {
@@ -39,6 +40,8 @@ interface MonacoDiffViewerProps {
   layout: "unified" | "split";
   /** Whether whitespace-only changes are hidden. */
   hideWhitespace: boolean;
+  /** Whether long lines soft-wrap (no horizontal scroll). */
+  wrapLines: boolean;
   conversationId: string;
   /** Saved comments — highlighted on the modified side. */
   comments: Comment[];
@@ -62,6 +65,7 @@ export function MonacoDiffViewer({
   path,
   layout,
   hideWhitespace,
+  wrapLines,
   conversationId,
   comments,
   activeSelection,
@@ -104,6 +108,12 @@ export function MonacoDiffViewer({
   const diffEditorRef = useRef<Parameters<DiffOnMount>[0] | null>(null);
   const [mounted, setMounted] = useState(false);
 
+  // The diff scrolls inside Monaco, so its offset is cached per conversation +
+  // file rather than via the DOM scroll-restore hook. Kept in its own namespace
+  // so a file's diff and its editor view don't share one offset.
+  const scrollKeyRef = useRef("");
+  scrollKeyRef.current = `viewer-diff:${conversationId}:${path}`;
+
   const handleMount: DiffOnMount = useCallback(
     (diffEditor, monaco) => {
       diffEditorRef.current = diffEditor;
@@ -118,6 +128,13 @@ export function MonacoDiffViewer({
             ? monaco.editor.EndOfLineSequence.CRLF
             : monaco.editor.EndOfLineSequence.LF,
         );
+      // Restore the reader's place in the diff and cache further scrolling under
+      // the diff's own key.
+      attachEditorScrollRestore(
+        modified,
+        () => scrollKeyRef.current,
+        () => modifiedEditorRef.current === modified,
+      );
       setMounted(true);
     },
     [after],
@@ -178,11 +195,14 @@ export function MonacoDiffViewer({
       automaticLayout: true,
       renderOverviewRuler: false,
       ignoreTrimWhitespace: hideWhitespace,
+      // Soft-wrap long lines in both panes so a narrow diff pane (2–3 side by
+      // side) reads top-to-bottom without horizontal scrolling.
+      diffWordWrap: wrapLines ? "on" : "off",
       // Collapse long unchanged runs into expandable bands (like the old pierre
       // diff / GitHub) so only changed hunks + a few context lines are shown.
       hideUnchangedRegions: { enabled: true, contextLineCount: 3 },
     }),
-    [layout, hideWhitespace],
+    [layout, hideWhitespace, wrapLines],
   );
 
   return (

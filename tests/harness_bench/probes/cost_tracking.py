@@ -33,8 +33,7 @@ from tests.harness_bench.verdict import Applicability, Priority, ProbeResult, Ve
 class CostTrackingProbe(CapabilityProbe):
     name = "cost_tracking"
     title = "Cost tracking"
-    # P1: reported, not merge-gating — a harness that doesn't surface cost is
-    # still usable; the operator just can't run a USD-cost policy against it.
+    # Missing cost data does not make a harness unusable.
     priority = Priority.P1
     applies_to = Applicability.BOTH
 
@@ -46,8 +45,6 @@ class CostTrackingProbe(CapabilityProbe):
             "completed": result.completed,
         }
 
-        # An env/auth failure or timeout means we never got a clean turn to
-        # measure — SKIP (never UNSUPPORTED), same contract as the other probes.
         infra = infra_failure_reason(result)
         if infra is not None:
             return ProbeResult(Verdict.SKIPPED, note=infra, detail=detail)
@@ -60,10 +57,7 @@ class CostTrackingProbe(CapabilityProbe):
                 detail=detail,
             )
 
-        # Require a POSITIVE value, not merely non-None: a completed turn always
-        # spends tokens, so a reported 0 cost / 0 tokens means the usage plumbing
-        # returned an empty default, not that tracking genuinely measured zero.
-        # Treating 0 as "supported" would be a false pass.
+        # Zero values may be empty defaults rather than measured usage.
         if result.total_cost_usd is not None and result.total_cost_usd > 0:
             return ProbeResult(
                 Verdict.SUPPORTED,
@@ -79,8 +73,6 @@ class CostTrackingProbe(CapabilityProbe):
                 ),
                 detail=detail,
             )
-        # Completed but no positive usage surfaced (absent, or a zero default) —
-        # not a capability gap we can assert, so SKIP with the reason.
         return ProbeResult(
             Verdict.SKIPPED,
             note="turn completed but the transport surfaced no usage/cost to observe",

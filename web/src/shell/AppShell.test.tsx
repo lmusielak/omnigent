@@ -1,3 +1,7 @@
+import type * as UseTerminalsModule from "@/hooks/useTerminals";
+import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
+import type * as UseSessionModule from "@/hooks/useSession";
+
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import {
@@ -10,7 +14,10 @@ import {
 } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import type { ServerInfo } from "@/lib/capabilities";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
 
 vi.mock("@/hooks/useConversations", () => ({
   useConversations: vi.fn(),
@@ -20,7 +27,7 @@ vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   // Keep the real module (inventoryTerminals, EMBEDDED_REPL_TERMINAL_ID)
   // — the REPL rail-inventory tests exercise the real filter; only the
   // network-backed hook is replaced.
-  ...(await importOriginal<typeof import("@/hooks/useTerminals")>()),
+  ...(await importOriginal<typeof UseTerminalsModule>()),
   useTerminals: vi.fn(() => ({ terminals: [], isLoading: false, error: null })),
 }));
 
@@ -32,14 +39,14 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   // Keep the real module (childSessionsQueryKey, MAX_TREE_DEPTH,
   // cachedTreeContains) — only the hook is replaced.
-  ...(await importOriginal<typeof import("@/hooks/useChildSessions")>()),
+  ...(await importOriginal<typeof UseChildSessionsModule>()),
   useChildSessions: vi.fn(() => ({ children: [], isLoading: false, error: null })),
 }));
 
 vi.mock("@/hooks/useSession", async (importOriginal) => ({
   // useRootSessionId stays real — with useSession mocked to a null /
   // top-level session it resolves synchronously without fetching.
-  ...(await importOriginal<typeof import("@/hooks/useSession")>()),
+  ...(await importOriginal<typeof UseSessionModule>()),
   useSession: vi.fn(() => ({ session: null, isLoading: false, error: null })),
 }));
 
@@ -181,6 +188,7 @@ vi.mock("./TerminalsPanel", () => ({
 
 import { useConversations } from "@/hooks/useConversations";
 import { useTerminals } from "@/hooks/useTerminals";
+
 const useConvMock = vi.mocked(useConversations);
 const useTerminalsMock = vi.mocked(useTerminals);
 
@@ -188,17 +196,21 @@ import {
   useWorkspaceEnvironment,
   useWorkspaceChangedFiles,
 } from "@/hooks/useWorkspaceChangedFiles";
+
 const useEnvironmentMock = vi.mocked(useWorkspaceEnvironment);
 const useChangedFilesMock = vi.mocked(useWorkspaceChangedFiles);
 
 import { useChildSessions } from "@/hooks/useChildSessions";
+
 const useChildSessionsMock = vi.mocked(useChildSessions);
 
 import { useSession } from "@/hooks/useSession";
+
 const useSessionMock = vi.mocked(useSession);
 
 import { useSessionAgent } from "@/hooks/useAgents";
 import type { Agent } from "@/hooks/useAgents";
+
 const useSessionAgentMock = vi.mocked(useSessionAgent);
 
 import { AppShell } from "./AppShell";
@@ -303,11 +315,32 @@ function SessionNavButton({ to }: { to: string }) {
   );
 }
 
-function renderShell(path: string) {
+/** Full ServerInfo with permissive defaults; override per test. */
+function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
+  return {
+    accounts_enabled: false,
+    single_user: false,
+    login_url: null,
+    needs_setup: false,
+    databricks_features: false,
+    managed_sandboxes_enabled: false,
+    sandbox_provider: null,
+    sharing_mode: "on",
+    public_sharing_enabled: true,
+    server_version: null,
+    smart_routing_enabled: false,
+    harness_install_enabled: false,
+    installable_harnesses: [],
+    dictation_available: false,
+    ...overrides,
+  };
+}
+
+function renderShell(path: string, info?: ServerInfo) {
   const qc = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
-  return render(
+  const tree = (
     <QueryClientProvider client={qc}>
       <TooltipProvider>
         <MemoryRouter initialEntries={[path]}>
@@ -336,18 +369,21 @@ function renderShell(path: string) {
           </Routes>
         </MemoryRouter>
       </TooltipProvider>
-    </QueryClientProvider>,
+    </QueryClientProvider>
   );
+  // Without an explicit info the CapabilitiesContext default ("loading")
+  // applies, matching production first paint and every pre-existing test.
+  return render(info ? <CapabilitiesProvider info={info}>{tree}</CapabilitiesProvider> : tree);
 }
 
 function mockConversations(
-  convs: Array<{
+  convs: {
     id: string;
     permission_level: number | null;
     labels?: Record<string, string>;
     host_id?: string | null;
     runner_id?: string | null;
-  }>,
+  }[],
 ) {
   useConvMock.mockReturnValue({
     data: {
@@ -432,7 +468,12 @@ beforeEach(() => {
   // todo list from one test doesn't leak into the next.
   // Reset terminal-first startup signals so one test's terminalPending /
   // failed status can't leak into another's terminalStartingUp.
-  useChatStore.setState({ todos: [], terminalPending: false, sessionStatus: "idle" });
+  useChatStore.setState({
+    todos: [],
+    terminalPending: false,
+    sessionStatus: "idle",
+    status: "idle",
+  });
 });
 
 afterEach(cleanup);
@@ -505,6 +546,22 @@ describe("AppShell header", () => {
 
     expect(screen.getByTestId("view-probe")).toHaveAttribute("data-terminal-starting-up", "false");
   });
+
+  it("keeps the terminal-startup spinner when a send is relaunching a failed session", () => {
+    // A runner disconnect marks the session failed, and that status lingers
+    // until the relaunched runner pushes a fresh edge. A send in flight
+    // (local status "streaming") means the host is relaunching the runner
+    // right now, so the spinner must show through the relaunch window
+    // instead of leaving a silent gap until the runner is fully booted.
+    mockConversations([
+      { id: "conv_terminal", permission_level: null, labels: { "omnigent.ui": "terminal" } },
+    ]);
+    useChatStore.setState({ terminalPending: true, sessionStatus: "failed", status: "streaming" });
+
+    renderShell("/c/conv_terminal");
+
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-terminal-starting-up", "true");
+  });
 });
 
 describe("TerminalFirstContext", () => {
@@ -573,6 +630,7 @@ describe("TerminalFirstContext", () => {
         permissionLevel: 4,
         parentSessionId: "conv_parent",
         subAgentName: null,
+        kind: "sub_agent",
       },
       isLoading: false,
       error: null,
@@ -1535,6 +1593,7 @@ describe("Subagents tab", () => {
         permissionLevel: 4,
         parentSessionId: "conv_parent",
         subAgentName: null,
+        kind: "sub_agent",
       },
       isLoading: false,
       error: null,
@@ -1584,6 +1643,27 @@ describe("FilesPanel visibility", () => {
 });
 
 describe("Right workspace card visibility", () => {
+  it("reserves the visible pane width plus its two desktop margins from the header", () => {
+    useEnvironmentMock.mockReturnValue({
+      data: { available: false, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_offset", permission_level: null }]);
+
+    renderShell("/c/conv_offset");
+
+    const panel = screen.getByRole("complementary", { name: "Workspace" });
+    const panelWidth = Number.parseFloat(panel.style.width);
+    const headerGroup = panel.parentElement;
+    expect(headerGroup?.querySelector("header")).not.toBeNull();
+    expect(headerGroup?.style.getPropertyValue("--workspace-panel-offset")).toBe(
+      `${panelWidth + 16}px`,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Collapse right panel" }));
+    expect(headerGroup?.style.getPropertyValue("--workspace-panel-offset")).toBe("0px");
+  });
+
   it("keeps the card mounted with Agents as the only tab for a minimal agent", () => {
     // A no-os_env agent (available: false) with no shells and no todos
     // still has the unconditional Agents tab (the panel lists at least
@@ -1631,9 +1711,10 @@ describe("Right workspace card visibility", () => {
   });
 
   it("starts open for a fresh session (no stored open-state)", () => {
-    // A brand-new session has no persisted open-state, so the rail opens by
-    // default — the card is mounted and the header offers Collapse, not
-    // Expand.
+    // A brand-new session has no persisted open-state, so the Appearance
+    // Workspace panel default applies. With no preference stored that
+    // default is open — the card is mounted and the header offers Collapse,
+    // not Expand.
     useEnvironmentMock.mockReturnValue({
       data: { available: false, root: null, home: null },
       isLoading: false,
@@ -1645,6 +1726,38 @@ describe("Right workspace card visibility", () => {
     expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Collapse right panel" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Expand right panel" })).toBeNull();
+  });
+
+  it("starts collapsed for a fresh session when Appearance default is collapsed", () => {
+    // The Appearance setting only seeds sessions with no saved open-state.
+    writeWorkspacePanelDefault("collapsed");
+    useEnvironmentMock.mockReturnValue({
+      data: { available: false, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_fresh_collapsed", permission_level: null }]);
+
+    renderShell("/c/conv_fresh_collapsed");
+
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Expand right panel" })).toBeInTheDocument();
+  });
+
+  it("restores a saved open-state even when Appearance default is collapsed", () => {
+    // Per-chat persistence wins over the Appearance default once the user
+    // has toggled the rail in that session.
+    writeWorkspacePanelDefault("collapsed");
+    writeSessionWorkspaceState("conv_saved_open", { open: true });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: false, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_saved_open", permission_level: null }]);
+
+    renderShell("/c/conv_saved_open");
+
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Collapse right panel" })).toBeInTheDocument();
   });
 
   it("persists the open-state per session across remounts", () => {
@@ -2588,6 +2701,40 @@ describe("Mobile session menu", () => {
     expect(screen.getByTestId("todo-panel")).toBeInTheDocument();
   });
 
+  it("opens the Tasks drawer for a codex-native session with todos", () => {
+    // Codex-native maps its plan updates to the same todo schema, so the
+    // Tasks entry must gate on codex-native too — not just claude-native.
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([
+      {
+        id: "conv_codex",
+        permission_level: null,
+        labels: { "omnigent.wrapper": "codex-native-ui" },
+      },
+    ]);
+    useChatStore.setState({
+      todos: [
+        { content: "Locate CLI parser", status: "in_progress", activeForm: "Locate CLI parser" },
+      ],
+    });
+
+    renderShell("/c/conv_codex");
+
+    expect(screen.getByTestId("todos-panel-drawer")).toHaveAttribute("data-state", "closed");
+    expect(screen.queryByTestId("todo-panel")).toBeNull();
+
+    openSessionMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: /Tasks/i }));
+
+    // A codex-native session with a non-empty plan opens the Tasks drawer,
+    // the same as a claude-native session with todos.
+    expect(screen.getByTestId("todos-panel-drawer")).toHaveAttribute("data-state", "open");
+    expect(screen.getByTestId("todo-panel")).toBeInTheDocument();
+  });
+
   it("keeps the FAB with only the Agents entry for a minimal agent", () => {
     // available:false → no files; no shells, no todos, no debug. The
     // Agents entry is unconditional (badge = 1, the main agent), so the
@@ -2644,6 +2791,7 @@ describe("AppShell clone/fork action", () => {
         permissionLevel: 4,
         parentSessionId: "conv_parent",
         subAgentName: null,
+        kind: "sub_agent",
       },
       isLoading: false,
       error: null,
@@ -2672,6 +2820,7 @@ describe("AppShell clone/fork action", () => {
         permissionLevel: 1,
         parentSessionId: null,
         subAgentName: null,
+        kind: "default",
       },
       isLoading: false,
       error: null,
@@ -2695,9 +2844,11 @@ describe("AppShell clone/fork action", () => {
 
 describe("AppShell share action", () => {
   it("shows the Share button to an owner of a top-level session", () => {
-    // permission_level null = owner. A top-level session can be shared.
+    // permission_level 4 = owner. Share is owner-only; a top-level session
+    // the viewer owns can be shared. (A multi-user owner's list row carries
+    // level 4; null only occurs in single-user mode, where Share is hidden.)
     withWindowOrigin("https://app.example.com", () => {
-      mockConversations([{ id: "conv_top", permission_level: null }]);
+      mockConversations([{ id: "conv_top", permission_level: 4 }]);
 
       renderShell("/c/conv_top");
 
@@ -2709,7 +2860,7 @@ describe("AppShell share action", () => {
 
   it("disables the Share button when the server is local", () => {
     withWindowOrigin("http://localhost:6767", () => {
-      mockConversations([{ id: "conv_top", permission_level: null }]);
+      mockConversations([{ id: "conv_top", permission_level: 4 }]);
 
       renderShell("/c/conv_top");
 
@@ -2721,6 +2872,66 @@ describe("AppShell share action", () => {
         ),
       ).toBeInTheDocument();
       expect(shareButton).toHaveAttribute("title", "Sharing is unavailable from a local server.");
+    });
+  });
+
+  it("disables the Share button when the server reports sharing_mode off", () => {
+    // Non-local origin isolates the reason to the server policy (not the
+    // local-server path), so the tooltip must be the sharing-off message.
+    withWindowOrigin("https://app.example.com", () => {
+      mockConversations([{ id: "conv_top", permission_level: 4 }]);
+
+      renderShell("/c/conv_top", serverInfo({ sharing_mode: "off" }));
+
+      const shareButton = screen.getByRole("button", { name: /share session/i });
+      expect(shareButton).toBeDisabled();
+      expect(shareButton).toHaveAttribute(
+        "title",
+        "Sharing has been disabled for this Omnigent server.",
+      );
+    });
+  });
+
+  it("hides the Share button entirely in single-user mode", () => {
+    // Non-local origin isolates the single-user gate from the local-server
+    // path. The explicit single_user marker (not just accounts-off/no-login,
+    // which a multi-user header deploy also reports) means no other users to
+    // share with, so the button is removed — not disabled like the
+    // local-server / sharing-off cases.
+    withWindowOrigin("https://app.example.com", () => {
+      mockConversations([{ id: "conv_top", permission_level: null }]);
+
+      renderShell("/c/conv_top", serverInfo({ single_user: true }));
+
+      expect(screen.queryByRole("button", { name: /share session/i })).toBeNull();
+    });
+  });
+
+  it("keeps the Share button on a multi-user header-auth deploy (not single_user)", () => {
+    // Header-auth multi-user (SSO proxy): accounts off AND no login_url, same
+    // shape as single-user, but single_user is false — the button must stay.
+    // This is the regression the single_user signal fixes.
+    withWindowOrigin("https://app.example.com", () => {
+      mockConversations([{ id: "conv_top", permission_level: 4 }]);
+
+      renderShell("/c/conv_top", serverInfo({ single_user: false }));
+
+      const shareButton = screen.getByRole("button", { name: /share session/i });
+      expect(shareButton).toBeInTheDocument();
+      expect(shareButton).toBeEnabled();
+    });
+  });
+
+  it("keeps the Share button enabled when sharing_mode is read_only", () => {
+    // read_only still permits (read) grants, so the affordance stays live —
+    // the modal caps the level, the button is not disabled.
+    withWindowOrigin("https://app.example.com", () => {
+      mockConversations([{ id: "conv_top", permission_level: 4 }]);
+
+      renderShell("/c/conv_top", serverInfo({ sharing_mode: "read_only" }));
+
+      const shareButton = screen.getByRole("button", { name: /share session/i });
+      expect(shareButton).toBeEnabled();
     });
   });
 
@@ -2744,6 +2955,7 @@ describe("AppShell share action", () => {
         permissionLevel: 4,
         parentSessionId: "conv_parent",
         subAgentName: null,
+        kind: "sub_agent",
       },
       isLoading: false,
       error: null,
@@ -2801,7 +3013,7 @@ describe("Mobile header actions menu", () => {
       mockConversations([
         {
           id: "conv_host",
-          permission_level: null,
+          permission_level: 4,
           labels: {},
           host_id: "host_a1b2",
           runner_id: "runner_token_abc",
@@ -2828,7 +3040,7 @@ describe("Mobile header actions menu", () => {
 
   it("disables the mobile Share item when the server is local", () => {
     withWindowOrigin("http://127.0.0.1:6767", () => {
-      mockConversations([{ id: "conv_host", permission_level: null, labels: {} }]);
+      mockConversations([{ id: "conv_host", permission_level: 4, labels: {} }]);
 
       renderShell("/c/conv_host");
       openActionsMenu();
@@ -2896,6 +3108,7 @@ describe("Mobile header actions menu", () => {
         permissionLevel: 1,
         parentSessionId: "conv_parent",
         subAgentName: null,
+        kind: "sub_agent",
       },
       isLoading: false,
       error: null,

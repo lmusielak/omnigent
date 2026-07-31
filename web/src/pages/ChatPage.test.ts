@@ -1,8 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
-import type { RenderItem } from "@/lib/renderItems";
+import type { Bubble, RenderItem } from "@/lib/renderItems";
 import type { ToolExecution } from "@/lib/blocks";
-import type { Bubble } from "@/lib/renderItems";
-import { BUILTIN_SLASH_COMMANDS, isSlashCommandText } from "@/components/SlashCommandMenu";
+import {
+  BUILTIN_SLASH_COMMANDS,
+  isSlashCommandText,
+  slashCommandMatches,
+} from "@/components/SlashCommandMenu";
 import { isSessionSharedWithOthers } from "@/lib/permissionsApi";
 import {
   buildPendingBubbles,
@@ -517,7 +520,7 @@ const elicitItem = (id: string, status: "pending" | "responded"): RenderItem => 
   response: status === "responded" ? { action: "accept" } : null,
 });
 const pendingIds = (items: RenderItem[]): string[] =>
-  items.map((it) => (it.kind === "elicitation" ? it.elicitationId : ""));
+  items.map((item) => (item.kind === "elicitation" ? item.elicitationId : ""));
 
 describe("collectPendingElicitations", () => {
   it("collects pending cards across bubbles in document order (newest last)", () => {
@@ -551,7 +554,7 @@ describe("stripPendingElicitations", () => {
     const bubbles = [assistantWith("a1", [elicitItem("e1", "pending"), textItem("t1")])];
     const stripped = stripPendingElicitations(bubbles);
     const a1 = stripped[0] as Extract<Bubble, { kind: "assistant" }>;
-    expect(a1.items.map((it) => it.kind)).toEqual(["text"]);
+    expect(a1.items.map((item) => item.kind)).toEqual(["text"]);
   });
 
   it("leaves answered cards inline", () => {
@@ -632,9 +635,14 @@ describe("computeShowsWorking", () => {
     expect(computeShowsWorking("running", opts({ hasPendingElicitation: true }))).toBe(false);
   });
 
-  it("a known-offline runner suppresses stale working status", () => {
-    expect(computeShowsWorking("running", opts({ runnerOnline: false }))).toBe(false);
-    expect(computeShowsWorking("waiting", opts({ runnerOnline: false }))).toBe(false);
+  it("live running/waiting status wins over a stale offline poll", () => {
+    // The `/health` poll reads stale-offline during the runner's connect
+    // window on a fresh session's first turn (10s poll cadence). A session
+    // actively reporting running/waiting cannot have an offline runner, so its
+    // live status must keep the indicator lit rather than being suppressed by
+    // the lagging poll.
+    expect(computeShowsWorking("running", opts({ runnerOnline: false }))).toBe(true);
+    expect(computeShowsWorking("waiting", opts({ runnerOnline: false }))).toBe(true);
   });
 
   it("unresolved runner health does not suppress active parent work", () => {
@@ -653,9 +661,11 @@ describe("computeShowsWorking", () => {
     expect(computeShowsWorking("idle", opts({ backgroundTaskCount: 0 }))).toBe(false);
   });
 
-  it("a known-offline runner suppresses the indicator even with background shells", () => {
-    // Offline beats every other signal: a stale shell count must not keep a
-    // dead session spinning.
+  it("a known-offline runner suppresses the indicator for an idle session with background shells", () => {
+    // For a session that is NOT actively working, known-offline beats a stale
+    // shell count: a dead session must not keep spinning on a background tally.
+    // (An actively running/waiting session is handled above — its live status
+    // wins over the offline poll.)
     expect(computeShowsWorking("idle", opts({ runnerOnline: false, backgroundTaskCount: 2 }))).toBe(
       false,
     );
@@ -999,20 +1009,23 @@ describe("buildSlashCommandMap", () => {
     expect(map["/mlflow-bug"]).toBe("File an MLflow bug.");
   });
 
-  it("matches skills via the same prefix filter the menu uses", () => {
-    // The menu (SlashCommandMenu) filters keys whose ``name.slice(1)``
-    // starts with the typed query. Verify the merged map plays nicely
-    // with that filter for a partially-typed skill name.
+  it("matches skills via the shared substring matcher the menu uses", () => {
     const map = buildSlashCommandMap(
       [
-        { name: "triage-issues", description: "Triage issues." },
+        {
+          name: "superpowers:using-superpowers",
+          description: "Establishes how to find and use skills",
+        },
         { name: "mlflow-bug", description: "File an MLflow bug." },
       ],
       true,
       true,
     );
-    const matches = Object.keys(map).filter((name) => name.slice(1).startsWith("tri"));
-    expect(matches).toEqual(["/triage-issues"]);
+    // A namespaced skill is found by its leaf name — the exact bug this fixes.
+    const matches = Object.keys(map).filter((name) =>
+      slashCommandMatches(name, "using-superpowers"),
+    );
+    expect(matches).toEqual(["/superpowers:using-superpowers"]);
   });
 });
 

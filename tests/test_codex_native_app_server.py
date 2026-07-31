@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -18,10 +19,205 @@ from omnigent.codex_native_app_server import (
     _POLICY_HOOK_TIMEOUT_SECONDS,
     CodexNativeAppServer,
     _codex_policy_hooks_settings,
+    _hooks_list_diagnostics,
+    _model_discovery_cache,
+    _our_policy_hooks_from_list,
+    _sync_codex_developer_instructions,
     build_codex_native_server,
+    discover_codex_model_options,
     trust_native_policy_hooks,
 )
 from omnigent.codex_native_hook import _EVALUATE_POLICY_TIMEOUT_S
+from omnigent.inner.codex_executor import _populate_codex_home_config
+
+
+async def test_discover_codex_model_options_strips_secrets_and_stops_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pre-launch discovery uses an empty home, no credentials, and clean teardown."""
+    from omnigent import codex_native_app_server
+
+    captured_env: dict[str, str] = {}
+
+    class _FakeProcess:
+        pid = None
+        returncode: int | None = None
+        terminated = False
+
+        def terminate(self) -> None:
+            self.terminated = True
+            self.returncode = 0
+
+        def kill(self) -> None:
+            self.returncode = -1
+
+        async def wait(self) -> int:
+            self.returncode = 0 if self.returncode is None else self.returncode
+            return self.returncode
+
+    process = _FakeProcess()
+
+    async def _fake_start(
+        *,
+        codex_path: str,
+        listen_url: str,
+        env: dict[str, str],
+        cwd: Path,
+    ) -> _FakeProcess:
+        assert codex_path == "/test/codex"
+        assert listen_url.startswith("ws://127.0.0.1:")
+        assert cwd.is_dir()
+        assert Path(env["CODEX_HOME"]).is_dir()
+        captured_env.update(env)
+        return process
+
+    async def _fake_wait(process: _FakeProcess, port: int) -> None:
+        assert process is not None
+        assert port > 0
+
+    class _FakeClient:
+        def __init__(self, *, ws_url: str, client_name: str) -> None:
+            assert ws_url.startswith("ws://127.0.0.1:")
+            assert client_name == "omnigent-codex-model-discovery"
+
+        async def connect(self) -> None:
+            return None
+
+        async def close(self) -> None:
+            return None
+
+        async def request(
+            self,
+            method: str,
+            params: dict[str, object],
+        ) -> dict[str, object]:
+            assert method == "model/list"
+            assert params == {"includeHidden": False}
+            return {
+                "result": {
+                    "data": [
+                        {
+                            "id": "coding-model",
+                            "model": "coding-model",
+                            "isDefault": True,
+                        }
+                    ],
+                    "nextCursor": None,
+                }
+            }
+
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "_clean_codex_env",
+        lambda: {
+            "PATH": "/bin",
+            "OPENAI_API_KEY": "openai-secret",
+            "OPENAI_BASE_URL": "https://example.invalid/v1",
+            "DATABRICKS_BEARER": "databricks-secret",
+            "DATABRICKS_CODEX_TOKEN": "databricks-secret",
+        },
+    )
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "_start_codex_model_discovery_process",
+        _fake_start,
+    )
+    monkeypatch.setattr(codex_native_app_server, "_wait_for_discovery_listener", _fake_wait)
+    monkeypatch.setattr(codex_native_app_server, "CodexAppServerClient", _FakeClient)
+    _model_discovery_cache.clear()
+
+    options = await discover_codex_model_options(codex_path="/test/codex")
+
+    assert options == [{"id": "coding-model", "model": "coding-model", "isDefault": True}]
+    assert captured_env == {"PATH": "/bin", "CODEX_HOME": captured_env["CODEX_HOME"]}
+    assert process.terminated is True
+    _model_discovery_cache.clear()
+
+
+def test_sync_developer_instructions_preserves_and_restores_user_config(tmp_path: Path) -> None:
+    """Framework instructions append without replacing the user's Codex guidance."""
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    config_path = codex_home / "config.toml"
+    config_path.write_text(
+        'model = "gpt-5.5"\ndeveloper_instructions = "Keep user guidance."\n',
+        encoding="utf-8",
+    )
+
+    _sync_codex_developer_instructions(codex_home, "Rename the session.")
+    _sync_codex_developer_instructions(codex_home, "Rename the session.")
+
+    config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    assert config["model"] == "gpt-5.5"
+    assert config["developer_instructions"] == ("Keep user guidance.\n\nRename the session.")
+
+    _sync_codex_developer_instructions(codex_home, None)
+
+    resumed_config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    assert resumed_config["developer_instructions"] == "Keep user guidance."
+
+
+def test_sync_developer_instructions_survives_reseeded_config(tmp_path: Path) -> None:
+    """A persisted sidecar restores the original base after config reseeding."""
+    codex_home = tmp_path / "codex-home"
+    source_home = tmp_path / "source-home"
+    codex_home.mkdir()
+    source_home.mkdir()
+    config_path = codex_home / "config.toml"
+    config_path.write_text(
+        'developer_instructions = "Keep original guidance."\n',
+        encoding="utf-8",
+    )
+    (source_home / "config.toml").write_text(
+        'developer_instructions = "New shared guidance."\n',
+        encoding="utf-8",
+    )
+
+    _sync_codex_developer_instructions(codex_home, "Rename the session.")
+    config_path.unlink()
+    _populate_codex_home_config(codex_home, source_home)
+
+    reseeded = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    assert reseeded["developer_instructions"] == "New shared guidance."
+
+    _sync_codex_developer_instructions(codex_home, None)
+
+    resumed = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    assert resumed["developer_instructions"] == "Keep original guidance."
+
+
+def test_sync_developer_instructions_recovers_legacy_augmented_config(tmp_path: Path) -> None:
+    """A missing sidecar does not capture an existing framework suffix as user base."""
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    config_path = codex_home / "config.toml"
+    config_path.write_text(
+        'developer_instructions = "Keep user guidance.\\n\\nRename the session."\n',
+        encoding="utf-8",
+    )
+
+    _sync_codex_developer_instructions(codex_home, "Rename the session.")
+
+    active = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    assert active["developer_instructions"] == "Keep user guidance.\n\nRename the session."
+
+    _sync_codex_developer_instructions(codex_home, None)
+
+    resumed = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    assert resumed["developer_instructions"] == "Keep user guidance."
+
+
+def test_sync_developer_instructions_skips_invalid_config(tmp_path: Path) -> None:
+    """Optional title metadata never blocks Codex startup on malformed config."""
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    config_path = codex_home / "config.toml"
+    config_path.write_text("invalid = [", encoding="utf-8")
+
+    _sync_codex_developer_instructions(codex_home, "Rename the session.")
+
+    assert config_path.read_text(encoding="utf-8") == "invalid = ["
+
 
 _CWD = "/home/user/repo"
 _OUR_COMMAND = "/venv/bin/python -m omnigent.codex_native_hook evaluate-policy --bridge-dir /b"
@@ -44,6 +240,17 @@ def _hook(key: str, command: str, trust: str, current_hash: str = "sha256:h") ->
         "trustStatus": trust,
         "currentHash": current_hash,
     }
+
+
+def test_hooks_list_empty_result_does_not_fall_back_to_envelope() -> None:
+    """A valid empty result remains authoritative over envelope metadata."""
+    listed = {
+        "result": {},
+        "data": [{"cwd": _CWD, "hooks": [_hook("k1", _OUR_COMMAND, "trusted")]}],
+    }
+
+    assert _our_policy_hooks_from_list(listed, _CWD) == []
+    assert "returned no hooks" in _hooks_list_diagnostics(listed, _CWD)
 
 
 @dataclass
@@ -157,7 +364,7 @@ def test_build_codex_native_server_profile_error_names_profile(
         lambda: sys.executable,
     )
     monkeypatch.setattr(
-        "omnigent.codex_native_app_server._read_databrickscfg",
+        "omnigent.codex_native_app_server._databricks_gateway_host",
         lambda _profile: None,
     )
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(tmp_path / "missing-databrickscfg"))
@@ -183,18 +390,13 @@ def test_build_codex_native_server_uses_profile_host_without_static_token(
     Native Codex accepts Databricks CLI OAuth profiles without static tokens.
 
     A default Omnigent install may not include ``databricks-sdk`` in the
-    runner process. In that case ``_read_databrickscfg`` cannot mint a bearer
-    at startup, but the profile's host is still enough: Codex gets an
-    ``auth.command`` that runs ``databricks auth token --profile`` at request
-    time.
+    runner process. In that case a bearer cannot be minted at startup, but the
+    profile's host is still enough: Codex gets an ``auth.command`` that runs
+    ``databricks auth token --profile`` at request time.
     """
     monkeypatch.setattr(
         "omnigent.codex_native_app_server._find_codex_cli",
         lambda: sys.executable,
-    )
-    monkeypatch.setattr(
-        "omnigent.codex_native_app_server._read_databrickscfg",
-        lambda _profile: None,
     )
     cfg_path = tmp_path / "databrickscfg"
     cfg_path.write_text(
@@ -214,7 +416,7 @@ def test_build_codex_native_server_uses_profile_host_without_static_token(
         socket_path=tmp_path / "codex.sock",
         codex_home=tmp_path / "codex-home",
         cwd=tmp_path,
-        model=None,
+        model="test-model",
         profile="oss",
         bridge_dir=tmp_path / "bridge",
         ap_server_url=None,
@@ -346,6 +548,9 @@ args = ["old"]
 [mcp_servers.omnigent.env] # stale generated env
 OLD = "1"
 
+[mcp_servers.omnigent.tools.sys_session_rename] # stale generated approval
+approval_mode = "prompt"
+
 [mcp_servers.other]
 command = "other"
 args = []
@@ -383,6 +588,9 @@ args = []
             "--bridge-dir",
             str(bridge_dir),
         ],
+        "tools": {
+            "sys_session_rename": {"approval_mode": "approve"},
+        },
     }
 
 
@@ -422,6 +630,9 @@ async def test_start_writes_fresh_mcp_config_without_leading_blanks(
             "--bridge-dir",
             str(bridge_dir),
         ],
+        "tools": {
+            "sys_session_rename": {"approval_mode": "approve"},
+        },
     }
 
 
@@ -458,6 +669,57 @@ async def test_already_trusted_hook_skips_batchwrite() -> None:
     client = _FakeCodexClient(hooks=[_hook("k1", _OUR_COMMAND, "trusted")])
     await trust_native_policy_hooks(client, cwd=_CWD)
     assert _batchwrite_calls(client) == []  # nothing to trust → no write
+
+
+def test_write_codex_policy_hooks_file_merges_user_hooks(tmp_path: Path) -> None:
+    """User hooks symlinked into the private home are merged into hooks.json.
+
+    _write_codex_policy_hooks_file replaces the symlink with a merged
+    regular file containing both the Omnigent policy hooks and the user's
+    hooks, so user hooks fire alongside policy enforcement.
+    """
+    from omnigent.codex_native_app_server import _write_codex_policy_hooks_file
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+
+    # Simulate what _populate_codex_home_config does: symlink the user's hooks.json
+    user_hooks = tmp_path / "user-hooks.json"
+    user_hooks.write_text(
+        '{"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "echo hi"}]}]}}'
+    )
+    (codex_home / "hooks.json").symlink_to(user_hooks)
+
+    _write_codex_policy_hooks_file(codex_home, bridge_dir, sys.executable)
+
+    hooks_path = codex_home / "hooks.json"
+    assert not hooks_path.is_symlink(), "symlink must be replaced by a regular file"
+    payload = json.loads(hooks_path.read_text())
+    hooks = payload["hooks"]
+    # Policy hooks present
+    assert "PreToolUse" in hooks
+    assert "PostToolUse" in hooks
+    assert "UserPromptSubmit" in hooks
+    # User's SessionStart hook merged in
+    assert "SessionStart" in hooks
+    assert hooks["SessionStart"][0]["hooks"][0]["command"] == "echo hi"
+
+
+def test_write_codex_policy_hooks_file_no_symlink_unchanged(tmp_path: Path) -> None:
+    """Without a symlink, hooks.json is written with only policy hooks."""
+    from omnigent.codex_native_app_server import _write_codex_policy_hooks_file
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+
+    _write_codex_policy_hooks_file(codex_home, bridge_dir, sys.executable)
+
+    payload = json.loads((codex_home / "hooks.json").read_text())
+    assert set(payload["hooks"]) == {"PreToolUse", "PostToolUse", "UserPromptSubmit"}
 
 
 async def test_missing_hook_raises() -> None:

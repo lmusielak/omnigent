@@ -24,7 +24,7 @@ from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TypeAlias, TypedDict
 from urllib.parse import quote
 
 import httpx
@@ -32,6 +32,7 @@ import httpx
 from omnigent.opencode_native_bridge import update_active_message_id, update_last_event_id
 from omnigent.opencode_native_client import OpenCodeClient, OpenCodeEvent
 from omnigent.opencode_native_permissions import (
+    OpenCodePermissionRequest,
     PolicyDecision,
     decision_to_reply,
     map_verdict_to_decision,
@@ -76,9 +77,20 @@ _OPENCODE_REAUTH_HINT = (
 # Bound the dedupe set so a long-lived session can't grow it without limit.
 _MAX_DEDUPE_KEYS = 8192
 
+_JsonObject: TypeAlias = dict[str, object]
+_JsonMapping: TypeAlias = Mapping[str, object]
+
+
+class _AssistantUsage(TypedDict):
+    cost: float
+    tokens: _JsonObject
+    model: str | None
+    model_id: str | None
+
+
 # Policy verdict resolver: receives a normalized policy input and returns a
 # verdict mapping (or None when no policy is configured / reachable).
-PolicyEvaluator = Callable[[Mapping[str, Any]], Awaitable[Mapping[str, Any] | None]]
+PolicyEvaluator = Callable[[_JsonMapping], Awaitable[_JsonMapping | None]]
 
 
 @dataclass
@@ -108,7 +120,7 @@ class OpenCodeForwarderState:
         return True
 
 
-def _int_or_zero(value: Any) -> int:
+def _int_or_zero(value: object) -> int:
     """Coerce an opencode token-count field to a non-negative int (0 otherwise)."""
     return value if isinstance(value, int) and value >= 0 else 0
 
@@ -173,14 +185,22 @@ class OpenCodeNativeForwarder:
         # messageID -> latest {cost, tokens, model, model_id} for assistant
         # messages (opencode reports cost/tokens per message). Summed into the
         # cumulative usage posted as ``external_session_usage``.
-        self._usage_by_message: dict[str, dict[str, Any]] = {}
-        self._last_usage_signature: tuple[tuple[str, Any], ...] | None = None
+        self._usage_by_message: dict[str, _AssistantUsage] = {}
+        self._last_usage_signature: tuple[tuple[str, object], ...] | None = None
         # Last model mirrored to Omnigent (provider/id), to dedupe switches.
         self._last_model: str | None = None
         # reasoning part id -> chars already streamed as a delta. opencode sends
         # the cumulative reasoning text on each ``part.updated``; we forward only
         # the new suffix so the web reasoning block grows once, not duplicated.
         self._reasoning_posted: dict[str, int] = {}
+        # The in-flight turn's assistant messageID (its per-turn ``response_id``),
+        # captured from ``message.updated`` and stamped on the running/idle status
+        # edges so the web chat renders this turn's tool calls live — the mirrored
+        # ``function_call`` items carry the SAME id. ``_running_response_id``
+        # records the id the ``running`` edge went out with, gating it to once per
+        # turn; both reset in :meth:`_end_turn`.
+        self._active_message_id: str | None = None
+        self._running_response_id: str | None = None
 
     async def seed_dedupe_from_history(self) -> None:
         """
@@ -319,7 +339,7 @@ class OpenCodeNativeForwarder:
 
     # --- posting helpers -------------------------------------------------
 
-    async def _post_event(self, event_type: str, data: dict[str, Any]) -> httpx.Response | None:
+    async def _post_event(self, event_type: str, data: _JsonObject) -> httpx.Response | None:
         """
         POST one Omnigent session event with a single retry.
 
@@ -341,9 +361,19 @@ class OpenCodeNativeForwarder:
             )
             return None
 
-    async def _post_status(self, status: str, *, extra: Mapping[str, Any] | None = None) -> None:
-        """Publish a coarse session status edge."""
-        data: dict[str, Any] = {"status": status}
+    async def _post_status(self, status: str, *, extra: _JsonMapping | None = None) -> None:
+        """Publish a coarse session status edge.
+
+        :param extra: Extra fields merged into the edge payload. On the
+            ``running``/``idle`` edges this carries ``{"response_id": <assistant
+            messageID>}``: when it matches the ``response_id`` on this turn's
+            mirrored ``function_call`` items, the web chat renders the in-flight
+            tool calls live (spinner + ticking elapsed timer) instead of static
+            completed cards, and the server tracks it (``active_response_id``) so
+            a mid-turn reconnect stays live. A ``failed`` edge instead carries
+            ``output`` / ``reauth_required``.
+        """
+        data: _JsonObject = {"status": status}
         if extra:
             data.update(extra)
         await self._post_event(_EXTERNAL_STATUS, data)
@@ -389,7 +419,7 @@ class OpenCodeNativeForwarder:
         )
 
     async def _post_tool_call(
-        self, call_id: str, tool: str, arguments: dict[str, Any], *, message_id: str | None
+        self, call_id: str, tool: str, arguments: _JsonObject, *, message_id: str | None
     ) -> None:
         """Mirror a tool invocation as a function_call item."""
         await self._post_event(
@@ -420,23 +450,54 @@ class OpenCodeNativeForwarder:
         )
 
     async def _begin_turn_if_needed(self) -> None:
-        """Post a single ``running`` status at the start of a turn."""
-        if not self.state.turn_active:
-            self.state.turn_active = True
-            await self._post_status(_STATUS_RUNNING)
+        """Emit the turn's id-bearing ``running`` edge once, when the id is known.
+
+        The ``running`` edge carries the assistant ``response_id`` (the opencode
+        messageID held in ``_active_message_id``) so the web chat can render this
+        turn's in-flight tool calls live — the mirrored ``function_call`` items
+        carry the SAME id. It fires once per turn and is deferred until the id is
+        known: a bare ``session.status`` busy can open the turn before the
+        assistant ``message.updated`` supplies the id, and emitting an id-less
+        (session-id-fallback) edge then would never match the tool-call items.
+        """
+        self.state.turn_active = True
+        if self._running_response_id is None and self._active_message_id is not None:
+            self._running_response_id = self._active_message_id
+            await self._post_status(
+                _STATUS_RUNNING, extra={"response_id": self._running_response_id}
+            )
 
     async def _end_turn(
-        self, *, status: str = _STATUS_IDLE, extra: Mapping[str, Any] | None = None
+        self, *, status: str = _STATUS_IDLE, extra: _JsonMapping | None = None
     ) -> None:
-        """Post the terminal status (idle by default) and clear active state."""
+        """Post the terminal status (idle by default), stamped with the turn's id.
+
+        The terminal edge carries the same ``response_id`` the ``running`` edge
+        used so the server retires this turn's live tool-call cards for the right
+        response; a caller may pass extra fields (e.g. ``output`` /
+        ``reauth_required`` on a ``failed`` edge), which are merged on top.
+        """
         self.state.turn_active = False
         # Reasoning deltas are per-turn; drop the per-part offsets so the map
         # can't grow across a long-lived session (the next turn's reasoning
         # parts carry fresh ids anyway).
         self._reasoning_posted.clear()
+        # Stamp the terminal edge with the id the ``running`` edge actually went
+        # out with (``_running_response_id``), then merge any caller-supplied
+        # fields on top. If a turn produced more than one assistant messageID,
+        # ``_active_message_id`` has advanced past the id that went live; using
+        # the running id keeps both edges consistent so the web retires the cards
+        # that were rendered live. Fall back to the latest assistant id (then the
+        # session id) when no running edge fired.
+        terminal_id = self._running_response_id or self._active_message_id
+        merged_extra: _JsonObject = {"response_id": self._response_id(terminal_id)}
+        if extra:
+            merged_extra.update(extra)
         if self._bridge_dir is not None:
             update_active_message_id(self._bridge_dir, None, status="idle")
-        await self._post_status(status, extra=extra)
+        await self._post_status(status, extra=merged_extra)
+        self._active_message_id = None
+        self._running_response_id = None
 
     # --- per-event handlers ----------------------------------------------
 
@@ -455,6 +516,10 @@ class OpenCodeNativeForwarder:
             return
         self._msg_role[message_id] = role
         if role == "assistant":
+            # This turn's per-turn ``response_id`` — the running/idle edges carry
+            # it so the web chat can correlate them with the tool-call items that
+            # already stamp the same id (renders in-flight tool calls live).
+            self._active_message_id = message_id
             if self._bridge_dir is not None:
                 update_active_message_id(self._bridge_dir, message_id, status="busy")
             await self._begin_turn_if_needed()
@@ -491,7 +556,7 @@ class OpenCodeNativeForwarder:
             # it so text and tool items land in the chat in step order.
             await self._flush_pending_text()
 
-    def _accumulate_text_part(self, part: Mapping[str, Any]) -> None:
+    def _accumulate_text_part(self, part: _JsonMapping) -> None:
         """Record the latest full-text snapshot for an assistant text part.
 
         ``message.part.updated`` carries the cumulative text each time, so we
@@ -513,7 +578,7 @@ class OpenCodeNativeForwarder:
             text,
         )
 
-    async def _post_user_text_part(self, part: Mapping[str, Any]) -> None:
+    async def _post_user_text_part(self, part: _JsonMapping) -> None:
         """Post a user message immediately so it precedes its assistant reply.
 
         Unlike assistant text (accumulated + flushed on step end), a user part
@@ -541,7 +606,7 @@ class OpenCodeNativeForwarder:
                 continue
             await self._post_assistant_text(text, message_id=message_id)
 
-    async def _handle_tool_part(self, part: Mapping[str, Any]) -> None:
+    async def _handle_tool_part(self, part: _JsonMapping) -> None:
         """Mirror an opencode tool part (call + result) as chat items.
 
         opencode reports a tool as a single part whose ``state`` advances
@@ -566,7 +631,9 @@ class OpenCodeNativeForwarder:
         status = state.get("status")
         if status == "completed" and self.state.mark(self._key("tool-out", call_id)):
             await self._post_tool_output(
-                call_id, _tool_output_text(state), message_id=response_message_id
+                call_id,
+                opencode_tool_output_text(state),
+                message_id=response_message_id,
             )
         elif status == "error" and self.state.mark(self._key("tool-out", call_id)):
             error = state.get("error")
@@ -574,7 +641,7 @@ class OpenCodeNativeForwarder:
                 call_id, f"[error] {error}" if error else "[error]", message_id=response_message_id
             )
 
-    async def _handle_reasoning_part(self, part: Mapping[str, Any]) -> None:
+    async def _handle_reasoning_part(self, part: _JsonMapping) -> None:
         """Forward an opencode ``reasoning`` part as transient reasoning deltas.
 
         opencode carries the cumulative chain-of-thought text on each
@@ -603,7 +670,7 @@ class OpenCodeNativeForwarder:
         )
         self._reasoning_posted[part_id] = len(text)
 
-    async def _handle_file_part(self, part: Mapping[str, Any]) -> None:
+    async def _handle_file_part(self, part: _JsonMapping) -> None:
         """Mirror an opencode ``file`` part — images as image blocks, else a note.
 
         opencode emits ``{type:"file", mime, url, filename}`` parts for images
@@ -641,10 +708,10 @@ class OpenCodeNativeForwarder:
         )
 
     async def _post_message_content(
-        self, role: str, content: list[dict[str, Any]], *, message_id: str | None
+        self, role: str, content: list[_JsonObject], *, message_id: str | None
     ) -> None:
         """Persist a message item with arbitrary content blocks (image / note)."""
-        item_data: dict[str, Any] = {"role": role, "content": content}
+        item_data: _JsonObject = {"role": role, "content": content}
         if role == "assistant":
             item_data["agent"] = _AGENT_NAME
         await self._post_event(
@@ -670,7 +737,7 @@ class OpenCodeNativeForwarder:
         await self._post_session_usage()
         await self._end_turn()
 
-    def _record_assistant_usage(self, message_id: str, info: Mapping[str, Any]) -> None:
+    def _record_assistant_usage(self, message_id: str, info: _JsonMapping) -> None:
         """Cache the latest cost/tokens/model for an assistant message.
 
         opencode reports ``cost`` (USD) + ``tokens`` per assistant message, so
@@ -690,7 +757,9 @@ class OpenCodeNativeForwarder:
         )
         self._usage_by_message[message_id] = {
             "cost": float(cost) if isinstance(cost, (int, float)) else 0.0,
-            "tokens": dict(tokens) if isinstance(tokens, Mapping) else {},
+            "tokens": {key: value for key, value in tokens.items() if isinstance(key, str)}
+            if isinstance(tokens, Mapping)
+            else {},
             "model": model,
             "model_id": model_id if isinstance(model_id, str) else None,
         }
@@ -707,7 +776,7 @@ class OpenCodeNativeForwarder:
             return
         cum_cost = 0.0
         cum_in = cum_out = cum_cache = 0
-        latest: dict[str, Any] | None = None
+        latest: _AssistantUsage | None = None
         for entry in self._usage_by_message.values():
             cum_cost += entry["cost"]
             tokens = entry["tokens"]
@@ -717,31 +786,34 @@ class OpenCodeNativeForwarder:
             if isinstance(cache, Mapping):
                 cum_cache += _int_or_zero(cache.get("read"))
             latest = entry
-        data: dict[str, Any] = {
+        data: _JsonObject = {
             "cumulative_cost_usd": round(cum_cost, 6),
             "cumulative_input_tokens": cum_in,
             "cumulative_output_tokens": cum_out,
             "cumulative_cache_read_input_tokens": cum_cache,
         }
         if latest is not None:
-            lt = latest["tokens"]
-            lcache = lt.get("cache") if isinstance(lt.get("cache"), Mapping) else {}
+            latest_tokens = latest["tokens"]
+            raw_cache = latest_tokens.get("cache")
+            latest_cache = raw_cache if isinstance(raw_cache, Mapping) else {}
             ctx = (
-                _int_or_zero(lt.get("input"))
-                + _int_or_zero(lcache.get("read"))
-                + _int_or_zero(lcache.get("write"))
+                _int_or_zero(latest_tokens.get("input"))
+                + _int_or_zero(latest_cache.get("read"))
+                + _int_or_zero(latest_cache.get("write"))
             )
             if ctx > 0:
                 data["context_tokens"] = ctx
-            if latest.get("model_id"):
+            model_id = latest["model_id"]
+            if model_id:
                 try:
                     from omnigent.llms.context_window import get_model_context_window
 
-                    data["context_window"] = get_model_context_window(latest["model_id"])
+                    data["context_window"] = get_model_context_window(model_id)
                 except Exception:  # noqa: BLE001 - context window is best effort.
                     pass
-            if latest.get("model"):
-                data["model"] = latest["model"]
+            model = latest["model"]
+            if model:
+                data["model"] = model
         signature = tuple(sorted(data.items()))
         if signature == self._last_usage_signature:
             return
@@ -770,7 +842,7 @@ class OpenCodeNativeForwarder:
             message = "OpenCode session ended with an error."
         status_code = data.get("statusCode") if isinstance(data, Mapping) else None
         is_auth = name == "ProviderAuthError" or (name == "APIError" and status_code in (401, 403))
-        extra: dict[str, Any] = {"output": message.strip()}
+        extra: _JsonObject = {"output": message.strip()}
         if is_auth:
             extra["output"] = f"{message.strip()}\n\n{_OPENCODE_REAUTH_HINT}"
             extra["reauth_required"] = True
@@ -846,7 +918,9 @@ class OpenCodeNativeForwarder:
                 exc_info=True,
             )
 
-    async def _resolve_permission(self, *, request_dict: Any) -> PolicyDecision:
+    async def _resolve_permission(
+        self, *, request_dict: OpenCodePermissionRequest
+    ) -> PolicyDecision:
         """
         Resolve a permission request to a normalized decision.
 
@@ -872,9 +946,9 @@ class OpenCodeNativeForwarder:
         return map_verdict_to_decision(verdict)
 
 
-def _tool_output_text(state: Mapping[str, Any]) -> str:
+def opencode_tool_output_text(state: _JsonMapping) -> str:
     """
-    Extract a string tool output from a completed tool part's ``state``.
+    Extract shared durable output from a completed OpenCode tool state.
 
     :param state: The opencode tool part ``state`` (``output`` /
         ``metadata.output``).

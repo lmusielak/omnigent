@@ -18,10 +18,12 @@ See ``designs/OIDC_AUTH.md`` §CLI Login Flow.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
 import stat
+import tempfile
 import time
 from pathlib import Path
 
@@ -53,6 +55,58 @@ def _normalize_server_url(server_url: str) -> str:
     return server_url.rstrip("/")
 
 
+def _write_tokens_file(path: Path, data: dict[str, dict[str, str | float]]) -> None:
+    """Atomically write the auth-tokens file, never exposing it readable.
+
+    The previous sequence was ``path.write_text(...)`` followed by ``os.chmod``.
+    ``write_text`` creates a missing file at the process umask (``0o644`` on a
+    typical box), so on the very first login — exactly when a session JWT is
+    first persisted — the token sat world-readable on disk until the ``chmod``
+    landed. ``clear_token`` did not ``chmod`` at all, relying on the mode of a
+    file that may not have been created here.
+
+    Mirrors ``claude_native_bridge._atomic_write_user_json``: write a
+    ``0o600`` temp beside the target, ``fsync``, then ``os.replace``. The temp
+    is created by :mod:`tempfile` with owner-only permissions before any bytes
+    are written, and the rename means a crash mid-write can no longer truncate
+    the file and lose every stored token.
+
+    Hardens the parent to ``0o700`` first (``mkdir`` alone won't
+    re-permission an existing ``0o755`` dir), so every writer routes
+    through here — including ``clear_token``.
+
+    :param path: Destination file, i.e. ``~/.omnigent/auth_tokens.json``.
+    :param data: The full token map to serialise.
+    :returns: None.
+    :raises OSError: If the temp cannot be written or replaced into place.
+    """
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        os.chmod(path.parent, stat.S_IRWXU)
+
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            tmp_path = Path(handle.name)
+            json.dump(data, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp_path, stat.S_IRUSR | stat.S_IWUSR)
+        os.replace(tmp_path, path)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            with contextlib.suppress(FileNotFoundError):
+                tmp_path.unlink()
+
+
 def _store_entry(server_url: str, entry: dict[str, str | float]) -> None:
     """Create or update a server's record in the auth-tokens file.
 
@@ -66,7 +120,6 @@ def _store_entry(server_url: str, entry: dict[str, str | float]) -> None:
         ``{"token": "...", "user_id": "...", "expires_at": 1750000000.0}``.
     """
     path = _token_file_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
 
     data: dict[str, dict[str, str | float]] = {}
     if path.exists():
@@ -77,8 +130,7 @@ def _store_entry(server_url: str, entry: dict[str, str | float]) -> None:
 
     data[_normalize_server_url(server_url)] = entry
 
-    path.write_text(json.dumps(data, indent=2))
-    os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+    _write_tokens_file(path, data)
 
 
 def store_token(
@@ -226,6 +278,37 @@ def load_databricks_org_id(server_url: str) -> str | None:
 DATABRICKS_ORG_ID_HEADER = "X-Databricks-Org-Id"
 
 
+# Opaque extra request headers for dev/test: a JSON object of header name→value
+# in :data:`DATABRICKS_EXTRA_HEADERS_ENV_VAR`. Databricks deployments use it to
+# carry request-routing selector headers so a request pins to a specific server
+# instance/replica instead of the default one. Folded into
+# :func:`databricks_request_headers` below so it travels with every
+# client→server connection built through that one helper — a per-call-site
+# bearer that skips this helper misses the selectors. Unset in prod.
+DATABRICKS_EXTRA_HEADERS_ENV_VAR = "OMNIGENT_DATABRICKS_EXTRA_HEADERS"
+
+
+def _databricks_extra_headers() -> dict[str, str]:
+    """Return the opaque extra request headers when configured, else ``{}``.
+
+    Reads :data:`DATABRICKS_EXTRA_HEADERS_ENV_VAR`, a JSON object of header
+    name→value. Missing or malformed (unset, not JSON, or not an object) →
+    ``{}``, so production and local runs are unaffected.
+
+    :returns: A header dict parsed from the env var, or an empty dict.
+    """
+    raw = os.environ.get(DATABRICKS_EXTRA_HEADERS_ENV_VAR, "").strip()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return {str(key): str(value) for key, value in parsed.items()}
+
+
 def databricks_request_headers(
     server_url: str, *, bearer_token: str | None = None
 ) -> dict[str, str]:
@@ -243,12 +326,17 @@ def databricks_request_headers(
     Both values are omitted when absent, so single-workspace and
     local-unauthenticated callers get ``{}`` and are unaffected.
 
+    Also folds in any opaque dev/test headers from
+    :data:`DATABRICKS_EXTRA_HEADERS_ENV_VAR` (request-routing selectors set by
+    some Databricks deployments) so every chokepoint that builds headers through
+    this one helper carries them when set.
+
     :param server_url: The server URL, e.g.
         ``"https://example.databricks.com/api/2.0/omnigent"``.
     :param bearer_token: The workspace bearer token, or ``None`` when the
         credential is supplied by a separate mechanism (or there is none).
-    :returns: A header dict carrying ``Authorization`` and/or
-        ``X-Databricks-Org-Id`` as available, possibly empty.
+    :returns: A header dict carrying ``Authorization``, ``X-Databricks-Org-Id``,
+        and/or the configured extra headers as available, possibly empty.
     """
     headers: dict[str, str] = {}
     if bearer_token:
@@ -256,6 +344,9 @@ def databricks_request_headers(
     org_id = load_databricks_org_id(server_url)
     if org_id:
         headers[DATABRICKS_ORG_ID_HEADER] = org_id
+    # Opaque dev/test extra headers (request-routing selectors); no-op in prod
+    # (env unset).
+    headers.update(_databricks_extra_headers())
     return headers
 
 
@@ -279,4 +370,4 @@ def clear_token(server_url: str) -> None:
     key = _normalize_server_url(server_url)
     if key in data:
         del data[key]
-        path.write_text(json.dumps(data, indent=2))
+        _write_tokens_file(path, data)

@@ -102,13 +102,19 @@ export interface OmnigentAppProps extends OmnigentHostConfig {
 // `main.tsx`'s fallback (accounts off, no login).
 const SERVER_INFO_OFFLINE_FALLBACK: ServerInfo = {
   accounts_enabled: false,
+  single_user: false,
   login_url: null,
   needs_setup: false,
   databricks_features: false,
   managed_sandboxes_enabled: false,
   sandbox_provider: null,
+  sharing_mode: "on",
+  public_sharing_enabled: true,
   server_version: null,
   smart_routing_enabled: false,
+  harness_install_enabled: false,
+  installable_harnesses: [],
+  dictation_available: false,
 };
 
 /**
@@ -131,9 +137,9 @@ function EmbedCapabilitiesProvider({ children }: { children: ReactNode }) {
     // main.tsx) so the chat UI still paints instead of hanging on "loading".
     void Promise.race([
       resolveServerInfo(),
-      new Promise<ServerInfo>((resolve) =>
-        setTimeout(() => resolve(SERVER_INFO_OFFLINE_FALLBACK), 1500),
-      ),
+      new Promise<ServerInfo>((resolve) => {
+        setTimeout(() => resolve(SERVER_INFO_OFFLINE_FALLBACK), 1500);
+      }),
     ]).then((resolved) => {
       if (alive) setInfo(resolved);
     });
@@ -157,9 +163,9 @@ function OmnigentProviders({
   // one-time side effects (wire the chat store to that client + resolve
   // identity). `initChatStore` only stashes the client for later cache
   // invalidation, so doing this in a mount-once initializer is fine.
-  const queryClient = useQueryClient();
+  const hostQueryClient = useQueryClient();
   useState(() => {
-    initChatStore(queryClient);
+    initChatStore(hostQueryClient);
     void resolveIdentity();
     return null;
   });

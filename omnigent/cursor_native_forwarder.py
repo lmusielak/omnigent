@@ -50,6 +50,7 @@ import httpx
 from omnigent import cursor_native_status
 from omnigent._native_post_delivery import post_may_have_been_delivered
 from omnigent.cursor_native_bridge import FORK_HISTORY_CLOSE_TAG, FORK_HISTORY_OPEN_TAG
+from omnigent.inner.native_attachments import ATTACHMENT_MARKER_STRIP_PATTERN
 
 _logger = logging.getLogger(__name__)
 
@@ -105,10 +106,10 @@ _CLAIM_FRESH_MS = 30_000
 # and prepends a large ``<user_info>…`` context dump as a separate user blob.
 # We forward only the former (unwrapped) and skip the latter.
 _USER_QUERY_RE = re.compile(r"<user_query>(.*?)</user_query>", re.DOTALL)
-# The executor injects ``[Attached: <path>]`` markers for web-UI attachments
-# before pasting into the TUI; cursor stores them inside the user_query, so
-# strip them from the mirrored bubble (the path is an internal bridge detail).
-_ATTACHMENT_MARKER_RE = re.compile(r"\[Attached:[^\]]*\]")
+# The executor injects ``[Attached: <path>]`` (or the could-not-load marker
+# from native_attachments) for web-UI attachments before pasting into the TUI;
+# cursor stores them inside the user_query, so strip them from the mirrored bubble.
+_ATTACHMENT_MARKER_RE = re.compile(ATTACHMENT_MARKER_STRIP_PATTERN)
 # On a fork into cursor, the executor prepends the prior conversation to the
 # first user message, fenced in <omnigent_fork_history>…</omnigent_fork_history>
 # (cursor_native_bridge.wrap_fork_preamble). cursor stores it inside the
@@ -508,9 +509,9 @@ def _read_last_used_model(store_path: Path) -> str | None:
 
     cursor records the active model in the ``meta`` table under key ``"0"`` as a
     hex-encoded JSON blob carrying ``lastUsedModel`` — the *base* model id (e.g.
-    ``"gpt-5.2"``, ``"claude-opus-4-6"``), the same namespace the curated picker
-    catalog (:func:`omnigent.cursor_native.cursor_base_model_options`) and the
-    ``/model`` picker use, so a mirrored value matches a picker option. It
+    ``"gpt-5.2"``, ``"claude-opus-4-6"``), the same namespace the live CLI
+    catalog parser and the ``/model`` picker use, so a mirrored value matches a
+    picker option. It
     updates in place whenever the user switches model in the TUI, so polling it
     is how the web picker learns of a terminal-side switch (the reverse of
     :func:`omnigent.cursor_native_bridge.inject_model_command`).

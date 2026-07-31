@@ -11,6 +11,7 @@ import textwrap
 import unittest
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -29,6 +30,7 @@ from omnigent.inner.executor import (
 from omnigent.inner.pi_executor import (
     PiExecutor,
     _build_models_json,
+    _databricks_model_wire_catalog,
     _generate_extension_js,
     _pi_provider_for_model,
     _PiRpcSession,
@@ -38,7 +40,8 @@ from omnigent.inner.pi_executor import (
     _split_pi_prompt,
     _ToolServer,
 )
-from omnigent.onboarding.databricks_config import DATABRICKS_CLAUDE_DEFAULT_MODEL
+from omnigent.model_catalog import ModelEntry
+from omnigent.model_metadata import ModelMetadata, ModelWireAPI
 from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
 
 
@@ -341,7 +344,41 @@ def test_sanitize_real_sys_session_send_args_collapses_to_object() -> None:
 
 class TestPiProviderForModel(unittest.TestCase):
     def test_gpt_model(self):
-        self.assertEqual(_pi_provider_for_model("databricks-gpt-5-4-mini"), "databricks")
+        self.assertEqual(_pi_provider_for_model("databricks-gpt-5-4-mini"), "databricks-openai")
+
+    def test_catalog_chat_only_gpt_model(self):
+        self.assertEqual(
+            _pi_provider_for_model(
+                "databricks-gpt-next",
+                frozenset({ModelWireAPI.OPENAI_CHAT}),
+            ),
+            "databricks",
+        )
+
+    def test_catalog_responses_gpt_model(self):
+        self.assertEqual(
+            _pi_provider_for_model(
+                "databricks-gpt-next",
+                frozenset({ModelWireAPI.OPENAI_RESPONSES}),
+            ),
+            "databricks-openai",
+        )
+
+    def test_generic_provider_uses_configured_wire(self):
+        self.assertEqual(
+            _pi_provider_for_model(
+                "gpt-next",
+                generic_openai_wire_api="chat",
+            ),
+            "databricks-completions",
+        )
+        self.assertEqual(
+            _pi_provider_for_model(
+                "gpt-next",
+                generic_openai_wire_api="responses",
+            ),
+            "databricks-openai",
+        )
 
     def test_claude_model(self):
         self.assertEqual(
@@ -445,6 +482,24 @@ class TestBuildModelsJson(unittest.TestCase):
         entry = next(e for e in provider["models"] if e["id"] == model)
         self.assertEqual(entry.get("input"), ["text", "image"])
 
+    def test_dynamic_reasoning_model_gets_reasoning_flag(self):
+        # DeepSeek streams output on ``reasoning_content``; without
+        # ``reasoning: true`` Pi's openai-completions parser never consumes
+        # that channel and the turn dies with "Stream ended without finish_reason".
+        # GLM now uses the Responses API so it no longer needs this flag.
+        model = "databricks-deepseek-r1"
+        result = _build_models_json("https://host.example.com", "tok", model=model)
+        provider = result["providers"][_pi_provider_for_model(model)]
+        entry = next(e for e in provider["models"] if e["id"] == model)
+        self.assertIs(entry.get("reasoning"), True, model)
+
+    def test_dynamic_non_reasoning_model_has_no_reasoning_flag(self):
+        model = "databricks-mlflow-2-5-pro"
+        result = _build_models_json("https://host.example.com", "tok", model=model)
+        provider = result["providers"][_pi_provider_for_model(model)]
+        entry = next(e for e in provider["models"] if e["id"] == model)
+        self.assertNotIn("reasoning", entry)
+
     def test_static_model_declared_image_capable(self):
         # #516 review: a STATIC (pre-registered) vision model must also
         # advertise image input. The dynamic-registration append is gated on
@@ -503,19 +558,18 @@ class TestBuildModelsJson(unittest.TestCase):
             self.assertNotIn("/ai-gateway/codex", base_url)
             self.assertEqual(base_url, "https://host.example.com/serving-endpoints")
 
-    def test_gemini_model_routed_off_codex_gateway(self):
-        # Gemini falls to the databricks-completions catch-all; it must land on
-        # serving-endpoints, not the codex URL it used to inherit (#241).
+    def test_gemini_model_routed_to_mlflow_gateway(self):
+        # Gemini uses /ai-gateway/mlflow/v1 — system.ai.* ids 404 at serving-endpoints
+        # and the Responses API returns 400 for Gemini.
         result = _build_models_json(
             "https://host.example.com",
             "tok",
-            {"openai": "https://host.example.com/ai-gateway/codex/v1"},
-            model="databricks-gemini-2-5-pro",
+            model="system.ai.gemini-3-flash",
         )
-        provider = result["providers"][_pi_provider_for_model("databricks-gemini-2-5-pro")]
-        self.assertEqual(provider["baseUrl"], "https://host.example.com/serving-endpoints")
+        provider = result["providers"][_pi_provider_for_model("system.ai.gemini-3-flash")]
+        self.assertEqual(provider["baseUrl"], "https://host.example.com/ai-gateway/mlflow/v1")
         self.assertIn(
-            "databricks-gemini-2-5-pro",
+            "system.ai.gemini-3-flash",
             [entry.get("id") for entry in provider["models"]],
         )
 
@@ -530,6 +584,44 @@ class TestBuildModelsJson(unittest.TestCase):
         p = result["providers"]
         self.assertEqual(p["databricks"]["baseUrl"], "https://openrouter.ai/api/v1")
         self.assertEqual(p["databricks-completions"]["baseUrl"], "https://openrouter.ai/api/v1")
+
+    def test_generic_openai_model_uses_configured_responses_wire(self):
+        result = _build_models_json(
+            "https://unused.example.com",
+            "tok",
+            {"openai": "https://gateway.example.com/v1"},
+            model="vendor/model-next",
+            openai_wire_api="responses",
+        )
+
+        responses = result["providers"]["databricks-openai"]
+        self.assertEqual(responses["baseUrl"], "https://gateway.example.com/v1")
+        self.assertIn("vendor/model-next", [entry["id"] for entry in responses["models"]])
+
+    def test_dedicated_gateway_uses_catalog_wire_and_workspace_chat_url(self):
+        result = _build_models_json(
+            "https://workspace.cloud.databricks.com",
+            "tok",
+            {
+                "openai": "https://123.ai-gateway.cloud.databricks.com/codex/v1",
+            },
+            model="databricks-gpt-next",
+            model_wire_apis={
+                "databricks-gpt-next": frozenset({ModelWireAPI.OPENAI_CHAT}),
+            },
+            openai_wire_api="responses",
+        )
+
+        chat = result["providers"]["databricks"]
+        self.assertEqual(
+            chat["baseUrl"],
+            "https://workspace.cloud.databricks.com/serving-endpoints",
+        )
+        self.assertIn("databricks-gpt-next", [entry["id"] for entry in chat["models"]])
+        self.assertEqual(
+            result["providers"]["databricks-openai"]["baseUrl"],
+            "https://123.ai-gateway.cloud.databricks.com/codex/v1",
+        )
 
     def test_api_key_set(self):
         result = _build_models_json("https://host.example.com", "mytoken")
@@ -1475,7 +1567,8 @@ class TestResolveModel(unittest.TestCase):
         with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
             executor = PiExecutor(model="constructor-default")
         self.assertEqual(
-            executor._resolve_model(ExecutorConfig(model="cfg-override")), "cfg-override"
+            _run(executor._resolve_model(ExecutorConfig(model="cfg-override"))),
+            "cfg-override",
         )
 
     def test_constructor_default_used_when_no_cfg_override(self):
@@ -1485,7 +1578,8 @@ class TestResolveModel(unittest.TestCase):
         with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
             executor = PiExecutor(model="constructor-default")
         self.assertEqual(
-            executor._resolve_model(ExecutorConfig(model=None)), "constructor-default"
+            _run(executor._resolve_model(ExecutorConfig(model=None))),
+            "constructor-default",
         )
 
     def test_cfg_model_used_when_no_constructor_default(self):
@@ -1496,7 +1590,8 @@ class TestResolveModel(unittest.TestCase):
         with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
             executor = PiExecutor()
         self.assertEqual(
-            executor._resolve_model(ExecutorConfig(model="config-model")), "config-model"
+            _run(executor._resolve_model(ExecutorConfig(model="config-model"))),
+            "config-model",
         )
 
 
@@ -2048,14 +2143,17 @@ class TestRunTurn(unittest.TestCase):
             fake_rpc.process.stdin = _FakeStreamWriter()
             fake_rpc._stderr_lines = []
 
+            errored = {
+                "role": "assistant",
+                "content": [],
+                "stopReason": "error",
+                "errorMessage": "Rate limited",
+            }
             lines = [
                 json.dumps({"type": "response", "success": True}),
-                json.dumps(
-                    {
-                        "type": "message_end",
-                        "message": {"stopReason": "error", "errorMessage": "Rate limited"},
-                    }
-                ),
+                json.dumps({"type": "message_end", "message": errored}),
+                # Pi's agent loop always emits agent_end after an errored call.
+                json.dumps({"type": "agent_end", "messages": [errored]}),
             ]
             for line in lines:
                 fake_rpc._line_queue.put_nowait(line)
@@ -2077,6 +2175,136 @@ class TestRunTurn(unittest.TestCase):
             self.assertEqual(len(events), 1)
             self.assertIsInstance(events[0], ExecutorError)
             self.assertIn("Rate limited", events[0].message)
+
+        _run(_test())
+
+    def test_message_end_error_with_stream_eof_fails_with_real_error(self):
+        """If pi dies after reporting the errored message (no agent_end ever
+        arrives), the turn still fails with pi's error message rather than
+        the generic ended-without-response fallback.
+        """
+
+        async def _test():
+            executor = self._make_executor()
+
+            fake_rpc = _PiRpcSession()
+            fake_rpc._line_queue = asyncio.Queue()
+            fake_rpc.process = MagicMock()
+            fake_rpc.process.returncode = None
+            fake_rpc.process.stdin = _FakeStreamWriter()
+            fake_rpc._stderr_lines = []
+
+            lines = [
+                json.dumps({"type": "response", "success": True}),
+                json.dumps(
+                    {
+                        "type": "message_end",
+                        "message": {"stopReason": "error", "errorMessage": "boom"},
+                    }
+                ),
+            ]
+
+            async def fake_read_line(timeout=120.0):
+                del timeout
+                if lines:
+                    return lines.pop(0)
+                return None  # EOF: process died without agent_end.
+
+            fake_rpc.read_line = fake_read_line
+
+            async def fake_ensure_rpc(*args, **kwargs):
+                return fake_rpc
+
+            executor._ensure_rpc = fake_ensure_rpc
+
+            events = [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "hello"}],
+                    [],
+                    "system",
+                )
+            ]
+
+            self.assertEqual(len(events), 1)
+            self.assertIsInstance(events[0], ExecutorError)
+            self.assertEqual(events[0].message, "boom")
+
+        _run(_test())
+
+    def test_post_tool_error_drains_agent_end_before_failing(self):
+        """A message_end error after a successful tool call fails the turn
+        with pi's error message, but only after consuming the trailing
+        ``agent_end`` — leaving it queued would make the next turn on the
+        same RPC session read the stale terminal event as its own end.
+        """
+
+        async def _test():
+            executor = self._make_executor()
+
+            fake_rpc = _PiRpcSession()
+            fake_rpc._line_queue = asyncio.Queue()
+            fake_rpc.process = MagicMock()
+            fake_rpc.process.returncode = None
+            fake_rpc.process.stdin = _FakeStreamWriter()
+            fake_rpc._stderr_lines = []
+
+            parse_error = "Expected property name or '}' in JSON at position 1 (line 1 column 2)"
+            errored_assistant = {
+                "role": "assistant",
+                "content": [],
+                "stopReason": "error",
+                "errorMessage": parse_error,
+            }
+            lines = [
+                json.dumps({"type": "response", "success": True}),
+                json.dumps(
+                    {
+                        "type": "tool_execution_end",
+                        "toolName": "sys_os_shell",
+                        "isError": False,
+                        "result": {"content": [{"type": "text", "text": "ok"}]},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "message_end",
+                        "message": errored_assistant,
+                    }
+                ),
+                # Pi always emits agent_end after the errored LLM call ends
+                # the agent loop; it carries the errored message.
+                json.dumps({"type": "agent_end", "messages": [errored_assistant]}),
+            ]
+            for line in lines:
+                fake_rpc._line_queue.put_nowait(line)
+
+            async def fake_ensure_rpc(*args, **kwargs):
+                return fake_rpc
+
+            executor._ensure_rpc = fake_ensure_rpc
+
+            events = [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "run smoke"}],
+                    [],
+                    "system",
+                )
+            ]
+
+            tool_completes = [e for e in events if isinstance(e, ToolCallComplete)]
+            self.assertEqual(len(tool_completes), 1)
+            self.assertEqual(tool_completes[0].status, ToolCallStatus.SUCCESS)
+            # The turn fails with pi's real error — no fabricated assistant
+            # text, no synthetic TurnComplete.
+            errors = [e for e in events if isinstance(e, ExecutorError)]
+            self.assertEqual([e.message for e in errors], [parse_error])
+            self.assertFalse(any(isinstance(e, TurnComplete) for e in events))
+            self.assertFalse(any(isinstance(e, TextChunk) for e in events))
+            # The trailing agent_end was consumed: nothing stale is left for
+            # the next turn on this RPC session.
+            self.assertTrue(fake_rpc._line_queue.empty())
 
         _run(_test())
 
@@ -2726,7 +2954,35 @@ def test_profile_gateway_resolves_databricks_default_model() -> None:
         ),
     ):
         executor = PiExecutor(gateway=True)
-    assert executor._resolve_model(ExecutorConfig(model=None)) == DATABRICKS_CLAUDE_DEFAULT_MODEL
+    assert _run(executor._resolve_model(ExecutorConfig(model=None))) == (
+        "catalog-databricks-claude-default"
+    )
+
+
+def test_catalog_default_is_registered_in_models_json() -> None:
+    """Pi registers a catalog-selected gateway default before launch."""
+    catalog_default = "databricks-claude-catalog-default"
+    with (
+        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch(
+            "omnigent.inner.pi_executor._read_databrickscfg",
+            return_value=DatabricksCredentials(host="https://h.example.com", token="tok"),
+        ),
+        patch(
+            "omnigent.model_catalog.resolve_catalog_model",
+            return_value=SimpleNamespace(model_id=catalog_default),
+        ),
+    ):
+        executor = PiExecutor(gateway=True)
+        resolved = _run(executor._resolve_model(ExecutorConfig(model=None)))
+
+    models = _build_models_json("https://h.example.com", "tok", model=resolved)
+    anthropic_ids = {
+        entry["id"] for entry in models["providers"]["databricks-anthropic"]["models"]
+    }
+
+    assert resolved == catalog_default
+    assert catalog_default in anthropic_ids
 
 
 def test_profile_gateway_default_does_not_clobber_explicit_model() -> None:
@@ -2745,7 +3001,109 @@ def test_profile_gateway_default_does_not_clobber_explicit_model() -> None:
         ),
     ):
         executor = PiExecutor(gateway=True, model="databricks-gpt-5-4")
-    assert executor._resolve_model(ExecutorConfig(model=None)) == "databricks-gpt-5-4"
+    assert _run(executor._resolve_model(ExecutorConfig(model=None))) == "databricks-gpt-5-4"
+
+
+def test_gateway_wire_catalog_fetches_once_and_indexes_aliases() -> None:
+    """The inner Pi executor reuses UC metadata for endpoint-style model ids."""
+    responses = frozenset({ModelWireAPI.OPENAI_RESPONSES})
+    entries = (
+        ModelEntry(
+            id="system.ai.gpt-next",
+            family="openai",
+            metadata=ModelMetadata(wire_apis=responses),
+        ),
+    )
+    with (
+        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch(
+            "omnigent.inner.pi_executor._read_databrickscfg",
+            return_value=DatabricksCredentials(host="https://h.example.com", token="tok"),
+        ),
+        patch(
+            "omnigent.model_catalog.fetch_databricks_model_service_entries",
+            return_value=entries,
+        ) as fetch,
+    ):
+        executor = PiExecutor(gateway=True)
+        first = _run(executor._load_gateway_model_wire_apis())
+        second = _run(executor._load_gateway_model_wire_apis())
+
+    assert first["databricks-gpt-next"] == responses
+    assert second is first
+    fetch.assert_called_once_with("https://h.example.com", "tok")
+
+
+def test_gateway_wire_catalog_failure_is_cached() -> None:
+    """A catalog outage does not delay every later Pi subprocess startup."""
+    with (
+        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch(
+            "omnigent.inner.pi_executor._read_databrickscfg",
+            return_value=DatabricksCredentials(host="https://h.example.com", token="tok"),
+        ),
+        patch(
+            "omnigent.model_catalog.fetch_databricks_model_service_entries",
+            side_effect=OSError("offline"),
+        ) as fetch,
+    ):
+        executor = PiExecutor(gateway=True)
+        assert _run(executor._load_gateway_model_wire_apis()) == {}
+        assert _run(executor._load_gateway_model_wire_apis()) == {}
+
+    fetch.assert_called_once_with("https://h.example.com", "tok")
+
+
+def test_dedicated_gateway_fetches_wire_catalog_from_workspace_host() -> None:
+    """Dedicated gateway hosts resolve their workspace before UC discovery."""
+    with (
+        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch(
+            "omnigent.inner.pi_executor._fetch_shell_command_token",
+            return_value="gateway-token",
+        ),
+        patch(
+            "omnigent.pi_native_credentials.resolve_databricks_workspace",
+            return_value=SimpleNamespace(host="https://workspace.cloud.databricks.com"),
+        ),
+        patch(
+            "omnigent.model_catalog.fetch_databricks_model_service_entries",
+            return_value=(),
+        ) as fetch,
+    ):
+        executor = PiExecutor(
+            gateway=True,
+            gateway_host="https://123.ai-gateway.cloud.databricks.com",
+            base_urls_override={"claude": "https://123.ai-gateway.cloud.databricks.com/anthropic"},
+            gateway_auth_command="printf token",
+        )
+        _run(executor._load_gateway_model_wire_apis())
+
+    fetch.assert_called_once_with(
+        "https://workspace.cloud.databricks.com",
+        "gateway-token",
+    )
+
+
+def test_generic_anthropic_gateway_skips_databricks_wire_catalog() -> None:
+    """A generic provider must not receive Databricks workspace API requests."""
+    with (
+        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch(
+            "omnigent.inner.pi_executor._fetch_shell_command_token",
+            return_value="provider-key",
+        ),
+        patch("omnigent.model_catalog.fetch_databricks_model_service_entries") as fetch,
+    ):
+        executor = PiExecutor(
+            gateway=True,
+            gateway_host="https://anthropic.example.com",
+            base_urls_override={"claude": "https://anthropic.example.com/v1"},
+            gateway_auth_command="printf token",
+        )
+        assert _run(executor._load_gateway_model_wire_apis()) == {}
+
+    fetch.assert_not_called()
 
 
 def test_ucode_gateway_host_path_does_not_inject_default_model() -> None:
@@ -2770,7 +3128,7 @@ def test_ucode_gateway_host_path_does_not_inject_default_model() -> None:
             gateway_host="https://example.databricks.com",
             gateway_auth_command="printf token",
         )
-    assert executor._resolve_model(ExecutorConfig(model=None)) is None
+    assert _run(executor._resolve_model(ExecutorConfig(model=None))) is None
 
 
 def test_non_gateway_path_does_not_inject_default_model() -> None:
@@ -2781,23 +3139,7 @@ def test_non_gateway_path_does_not_inject_default_model() -> None:
     """
     with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
         executor = PiExecutor()
-    assert executor._resolve_model(ExecutorConfig(model=None)) is None
-
-
-def test_databricks_default_model_is_resolvable_in_models_json() -> None:
-    """
-    The shared Databricks default must route to the anthropic provider AND
-    be listed in that provider's models — otherwise the default the
-    producer/executor inject can't be resolved by pi at spawn time.
-
-    Failure means the default-model constant and pi's models.json drifted
-    apart: every modelless gateway agent would fail its first turn with a
-    pi "unknown model" error.
-    """
-    assert _pi_provider_for_model(DATABRICKS_CLAUDE_DEFAULT_MODEL) == "databricks-anthropic"
-    models = _build_models_json("https://host.example.com", "tok")
-    anthropic_ids = [m["id"] for m in models["providers"]["databricks-anthropic"]["models"]]
-    assert DATABRICKS_CLAUDE_DEFAULT_MODEL in anthropic_ids
+    assert _run(executor._resolve_model(ExecutorConfig(model=None))) is None
 
 
 def test_models_json_lists_only_gateway_verified_models() -> None:
@@ -2812,7 +3154,17 @@ def test_models_json_lists_only_gateway_verified_models() -> None:
     Anthropic passthrough, the llama endpoint 404s) fails at request time
     for anyone who selects it.
     """
-    models = _build_models_json("https://host.example.com", "tok")
+    wire_catalog = {
+        "databricks-gpt-5-4-mini": frozenset({ModelWireAPI.OPENAI_CHAT}),
+        "databricks-gpt-5-4": frozenset({ModelWireAPI.OPENAI_CHAT}),
+        "databricks-gpt-5-5": frozenset({ModelWireAPI.OPENAI_RESPONSES}),
+        "databricks-gpt-5-5-pro": frozenset({ModelWireAPI.OPENAI_RESPONSES}),
+    }
+    models = _build_models_json(
+        "https://host.example.com",
+        "tok",
+        model_wire_apis=wire_catalog,
+    )
     providers = models["providers"]
     anthropic_ids = [m["id"] for m in providers["databricks-anthropic"]["models"]]
     assert anthropic_ids == [
@@ -2820,10 +3172,15 @@ def test_models_json_lists_only_gateway_verified_models() -> None:
         "databricks-claude-sonnet-4-6",
         "databricks-claude-sonnet-4-5",
     ]
-    openai_ids = [m["id"] for m in providers["databricks"]["models"]]
-    assert openai_ids == [
+    # Older GPT models (no tool-rejection via /chat/completions) → completions.
+    openai_completions_ids = [m["id"] for m in providers["databricks"]["models"]]
+    assert openai_completions_ids == [
         "databricks-gpt-5-4-mini",
         "databricks-gpt-5-4",
+    ]
+    # Newer GPT → responses API. Kimi/inkling/Qwen3 registered dynamically only.
+    openai_responses_ids = [m["id"] for m in providers["databricks-openai"]["models"]]
+    assert openai_responses_ids == [
         "databricks-gpt-5-5",
         "databricks-gpt-5-5-pro",
     ]
@@ -2832,10 +3189,40 @@ def test_models_json_lists_only_gateway_verified_models() -> None:
     assert providers["databricks-completions"]["models"] == []
 
 
+def test_models_json_unknown_gpt_metadata_fails_toward_responses() -> None:
+    """An offline catalog never sends a newly released GPT to Chat by guess."""
+    models = _build_models_json("https://host.example.com", "tok")
+
+    assert models["providers"]["databricks"]["models"] == []
+    assert [model["id"] for model in models["providers"]["databricks-openai"]["models"]] == [
+        "databricks-gpt-5-4-mini",
+        "databricks-gpt-5-4",
+        "databricks-gpt-5-5",
+        "databricks-gpt-5-5-pro",
+    ]
+
+
+def test_databricks_wire_catalog_indexes_system_and_endpoint_aliases() -> None:
+    """UC system ids supply wire metadata for serving-endpoint aliases."""
+    wire_apis = frozenset({ModelWireAPI.OPENAI_RESPONSES})
+    catalog = _databricks_model_wire_catalog(
+        [
+            ModelEntry(
+                id="system.ai.gpt-next",
+                family="openai",
+                metadata=ModelMetadata(wire_apis=wire_apis),
+            )
+        ]
+    )
+
+    assert catalog["system.ai.gpt-next"] == wire_apis
+    assert catalog["databricks-gpt-next"] == wire_apis
+
+
 def test_models_json_uses_oss_verified_gpt_55_caps() -> None:
     """GPT-5.5 endpoint metadata on the OSS profile advertises 128K output."""
     models = _build_models_json("https://host.example.com", "tok")
-    by_id = {m["id"]: m for m in models["providers"]["databricks"]["models"]}
+    by_id = {m["id"]: m for m in models["providers"]["databricks-openai"]["models"]}
     for model_id in ("databricks-gpt-5-5", "databricks-gpt-5-5-pro"):
         assert by_id[model_id]["contextWindow"] == 400000
         assert by_id[model_id]["maxTokens"] == 128000
@@ -2871,6 +3258,7 @@ def test_build_models_json_registers_unknown_model_with_routed_provider() -> Non
     # _pi_provider_for_model routes it to, advertising image input so Pi
     # doesn't strip attached images (#515).
     entry = next((e for e in completions["models"] if e["id"] == "moonshotai/kimi-k2.6"), None)
+    # Non-Databricks kimi on OpenRouter uses completions path (no reasoning flag needed).
     assert entry == {"id": "moonshotai/kimi-k2.6", "input": ["text", "image"]}
     # …and that provider points at the generic gateway with the
     # Chat-Completions dialect OpenRouter speaks.

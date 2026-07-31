@@ -25,8 +25,7 @@ os.environ.setdefault("OMNIGENT_DISABLE_CATALOG_LOOKUP", "1")
 
 # Pin header mode for the whole suite. Header is the env-unset default,
 # but a developer's shell often has OMNIGENT_AUTH_ENABLED=1 set (the
-# multi-user opt-in they use to test the login flow locally; the
-# pre-rename OMNIGENT_ACCOUNTS_ENABLED is still honored too) — and that
+# multi-user opt-in they use to test the login flow locally) — and that
 # enable switch would flip the env-unset default to accounts (or oidc, if
 # the shell also exports OMNIGENT_OIDC_ISSUER), booting every server in
 # multi-user mode and failing loud with "Missing required environment
@@ -56,6 +55,7 @@ os.environ.setdefault("OMNIGENT_AUTH_PROVIDER", "header")
 os.environ.setdefault("OMNIGENT_LOCAL_SINGLE_USER", "1")
 
 from omnigent.db.utils import _engine_cache, _engine_lock, get_or_create_engine
+from omnigent.runtime.filesystem_registry import GitFilesystemRegistry
 from tests import _model_pools
 
 pytest_plugins = ["tests._token_usage"]
@@ -334,6 +334,94 @@ def _isolate_codex_native_state(
     """
     state_dir = tmp_path_factory.mktemp("codex-native-state")
     monkeypatch.setenv("OMNIGENT_CODEX_NATIVE_STATE_DIR", str(state_dir))
+
+
+@pytest.fixture()
+def untracked_cache_start() -> None:
+    """Opt back in to the real :meth:`GitFilesystemRegistry.start`.
+
+    Request this alongside the tests that exercise the optimization
+    worker itself; :func:`_stub_untracked_cache_start` then leaves the
+    method alone.
+
+    :returns: None.
+    """
+
+
+@pytest.fixture(autouse=True)
+def _stub_untracked_cache_start(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep the git untracked-cache worker out of unrelated tests.
+
+    :meth:`GitFilesystemRegistry.start` spawns a daemon thread that shells
+    out to git. It lands at an unpredictable moment, so a test that swaps
+    the process-global ``subprocess.run`` can record the worker's argv as
+    one of its own calls and fail on an assertion about a wholly unrelated
+    command. Stubbing the method by default removes the race for every
+    such test; the worker's own tests request ``untracked_cache_start``.
+
+    :param request: Pytest request, inspected for the opt-in fixture.
+    :param monkeypatch: Pytest monkeypatch fixture; restores the method
+        at teardown.
+    :returns: None.
+    """
+    if "untracked_cache_start" in request.fixturenames:
+        return
+    monkeypatch.setattr(GitFilesystemRegistry, "start", lambda self: None)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def cleanup_snapshot_failures(pytestconfig: pytest.Config) -> Generator[None, None, None]:
+    """Give every xdist worker its own snapshot-failures directory.
+
+    The pytest-playwright-visual-snapshot plugin ships a session-scoped
+    autouse fixture of this same name that ``rmtree``s then ``mkdir``s a
+    single static path (``playwright_visual_snapshot_failures_path``) at
+    session start. That fixture runs in *every* pytest session — including
+    the non-visual unit shards — and under ``-n`` all workers target the one
+    path: the rmtree/mkdir sequence is non-atomic, so one worker's
+    ``mkdir(exist_ok=True)`` re-raises ``FileExistsError`` when another
+    worker deletes the dir in the window between them, and that fixture error
+    cascades to every test on the worker. This override (a conftest fixture
+    shadows the plugin fixture of the same name for the whole ``tests/`` tree)
+    keys the leaf off ``PYTEST_XDIST_WORKER`` so no two workers ever touch the
+    same directory — the race is gone by construction, with no retries or
+    sleeps. The shared parent is only ever created (never deleted), so the
+    plugin's delete-then-create-the-same-dir window cannot recur.
+
+    Without xdist (the serial ``ui-snapshot.yml`` visual gate) the worker id
+    is unset and the base path is used unchanged, so the committed snapshot
+    layout and the CI artifact upload are unaffected.
+    """
+    import shutil
+
+    from pytest_playwright_visual_snapshot.plugin import SnapshotPaths, _get_option
+
+    root_dir = Path(pytestconfig.rootdir)  # type: ignore[arg-type]
+
+    SnapshotPaths.snapshots_path = Path(
+        _get_option(pytestconfig, "playwright_visual_snapshots_path", cast=str)
+        or (root_dir / "__snapshots__")
+    )
+
+    base_failures_path = Path(
+        _get_option(pytestconfig, "playwright_visual_snapshot_failures_path", cast=str)
+        or (root_dir / "snapshot_failures")
+    )
+    # Per-worker leaf under xdist; the base path itself when run serially
+    # (master process / no xdist), keeping non-xdist output identical.
+    worker = os.environ.get("PYTEST_XDIST_WORKER")
+    failures_path = base_failures_path / worker if worker else base_failures_path
+    SnapshotPaths.failures_path = failures_path
+
+    # Only this worker's own leaf is ever removed, so the rmtree/mkdir pair is
+    # uncontended; parents=True only creates the shared parent, never deletes it.
+    shutil.rmtree(failures_path, ignore_errors=True)
+    failures_path.mkdir(parents=True, exist_ok=True)
+
+    yield
 
 
 @pytest.fixture(scope="session")
